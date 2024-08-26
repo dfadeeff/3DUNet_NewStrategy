@@ -26,7 +26,6 @@ def z_score_normalization(data):
     normalized_data = (data - mean) / (std + 1e-8)
     return normalized_data, mean.item(), std.item()
 
-# Updated visualization function
 def visualize_input(modalities, writer, global_step):
     fig, axs = plt.subplots(2, 2, figsize=(12, 12))
     modality_names = ['FLAIR', 'T1', 'T1c', 'T2']
@@ -165,7 +164,7 @@ def main():
         print_memory_usage()
 
     # Save the model
-    torch.save(model.state_dict(), 'unet3d_model_z_norm.pth')
+    torch.save(model.state_dict(), 'unet3d_model_znorm.pth')
 
     # Calculate average normalization parameters across all patients
     avg_normalization_params = {}
