@@ -38,6 +38,31 @@ def visualize_input(modalities, writer, global_step):
     writer.add_figure('Input Modalities', fig, global_step)
     plt.close(fig)
 
+def save_checkpoint(model, optimizer, epoch, loss, normalization_params, filename="checkpoint.pth"):
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+        'normalization_params': normalization_params
+    }, filename)
+    print(f"Checkpoint saved: {filename}")
+
+def load_checkpoint(model, optimizer, filename="checkpoint.pth"):
+    if os.path.isfile(filename):
+        print(f"Loading checkpoint '{filename}'")
+        checkpoint = torch.load(filename)
+        start_epoch = checkpoint['epoch'] + 1
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        loss = checkpoint['loss']
+        normalization_params = checkpoint['normalization_params']
+        print(f"Loaded checkpoint '{filename}' (epoch {start_epoch})")
+        return start_epoch, normalization_params
+    else:
+        print(f"No checkpoint found at '{filename}'")
+        return 0, {}
+
 def main():
     # Set random seed for reproducibility
     torch.manual_seed(42)
@@ -76,13 +101,13 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     # Setup TensorBoard
-    writer = SummaryWriter('runs/3d_unet_experiment_znorm')
+    writer = SummaryWriter('runs/3d_unet_experiment_znorm_checkpoints')
 
-    # Normalization parameters storage
-    normalization_params = {}
+    # Load checkpoint if exists
+    start_epoch, normalization_params = load_checkpoint(model, optimizer)
 
     # Training loop
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
         for batch_idx, (modalities, patient_ids) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
@@ -159,11 +184,15 @@ def main():
             writer.add_image('Ground Truth', make_grid(target[0, target.shape[1]//2, :, :].unsqueeze(0)), epoch)
             writer.add_image('Prediction', make_grid(outputs[0, :, outputs.shape[2]//2, :, :]), epoch)
 
+        # Save checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            save_checkpoint(model, optimizer, epoch, epoch_loss, normalization_params)
+
         # Clear memory
         gc.collect()
         print_memory_usage()
 
-    # Save the model
+    # Save the final model
     torch.save(model.state_dict(), 'unet3d_model_znorm.pth')
 
     # Calculate average normalization parameters across all patients
