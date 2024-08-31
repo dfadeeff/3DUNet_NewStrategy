@@ -163,4 +163,5 @@ cython_debug/
 *.pth
 runs/
 .idea/vcs.xml
-*.pth
+test_results
+test_restuls/
