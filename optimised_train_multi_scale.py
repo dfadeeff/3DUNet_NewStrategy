@@ -6,11 +6,9 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
 import os
-import json
 import SimpleITK as sitk
 from sklearn.model_selection import train_test_split
 from model_multi_scale import MultiScaleUNet3D, MultiScaleLoss, normalize_with_percentile
-
 
 class PatchBrainMRIDataset(Dataset):
     def __init__(self, root_dir, patch_size=(64, 64, 64), stride=(32, 32, 32)):
@@ -70,9 +68,12 @@ class PatchBrainMRIDataset(Dataset):
         patch_t1c = t1c[z:z + self.patch_size[0], y:y + self.patch_size[1], x:x + self.patch_size[2]]
         patch_t2 = t2[z:z + self.patch_size[0], y:y + self.patch_size[1], x:x + self.patch_size[2]]
 
-        patch = np.stack([patch_flair, patch_t1, patch_t1c, patch_t2], axis=0)
-        return torch.from_numpy(patch).float()
+        # Stack input modalities (FLAIR, T1c, T2)
+        input_patch = np.stack([patch_flair, patch_t1c, patch_t2], axis=0)
+        # T1 as target
+        target_patch = patch_t1[np.newaxis, ...]
 
+        return torch.from_numpy(input_patch).float(), torch.from_numpy(target_patch).float()
 
 def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_multiscale.pth"):
     torch.save({
@@ -82,7 +83,6 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_multisca
         'loss': loss,
     }, filename)
     print(f"Checkpoint saved: {filename}")
-
 
 def load_checkpoint(model, optimizer, filename="checkpoint_multiscale.pth"):
     if os.path.isfile(filename):
@@ -98,7 +98,6 @@ def load_checkpoint(model, optimizer, filename="checkpoint_multiscale.pth"):
         print(f"No checkpoint found at '{filename}'")
         return 0
 
-
 def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer):
     for epoch in range(num_epochs):
         model.train()
@@ -107,10 +106,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
         running_contrast = 0.0
         running_style = 0.0
 
-        for batch_idx, patches in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
-            patches = patches.to(device)
-            inputs = patches[:, :3]  # FLAIR, T1c, T2
-            targets = patches[:, 3:4]  # T1
+        for batch_idx, (inputs, targets) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
+            inputs, targets = inputs.to(device), targets.to(device)
 
             optimizer.zero_grad()
 
@@ -131,16 +128,14 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
             running_style += style.item()
 
             if batch_idx % 10 == 0:
-                print(
-                    f"Batch {batch_idx}, Loss: {loss.item():.4f}, MSE: {mse.item():.4f}, Contrast: {contrast.item():.4f}, Style: {style.item():.4f}")
+                print(f"Batch {batch_idx}, Loss: {loss.item():.4f}, MSE: {mse.item():.4f}, Contrast: {contrast.item():.4f}, Style: {style.item():.4f}")
 
         epoch_loss = running_loss / len(train_loader)
         epoch_mse = running_mse / len(train_loader)
         epoch_contrast = running_contrast / len(train_loader)
         epoch_style = running_style / len(train_loader)
 
-        print(
-            f"Epoch [{epoch + 1}/{num_epochs}], Total Loss: {epoch_loss:.4f}, MSE: {epoch_mse:.4f}, Contrast: {epoch_contrast:.4f}, Style: {epoch_style:.4f}")
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Total Loss: {epoch_loss:.4f}, MSE: {epoch_mse:.4f}, Contrast: {epoch_contrast:.4f}, Style: {epoch_style:.4f}")
 
         writer.add_scalar('Training/Total Loss', epoch_loss, epoch)
         writer.add_scalar('Training/MSE Loss', epoch_mse, epoch)
@@ -148,8 +143,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
         writer.add_scalar('Training/Style Loss', epoch_style, epoch)
 
         val_loss, val_mse, val_contrast, val_style = validate(model, val_loader, criterion, device)
-        print(
-            f"Validation Loss: {val_loss:.4f}, MSE: {val_mse:.4f}, Contrast: {val_contrast:.4f}, Style: {val_style:.4f}")
+        print(f"Validation Loss: {val_loss:.4f}, MSE: {val_mse:.4f}, Contrast: {val_contrast:.4f}, Style: {val_style:.4f}")
 
         writer.add_scalar('Validation/Total Loss', val_loss, epoch)
         writer.add_scalar('Validation/MSE Loss', val_mse, epoch)
@@ -163,7 +157,6 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
 
     print("Training completed successfully!")
 
-
 def validate(model, val_loader, criterion, device):
     model.eval()
     val_loss = 0.0
@@ -172,10 +165,8 @@ def validate(model, val_loader, criterion, device):
     val_style = 0.0
 
     with torch.no_grad():
-        for patches in val_loader:
-            patches = patches.to(device)
-            inputs = patches[:, :3]  # FLAIR, T1c, T2
-            targets = patches[:, 3:4]  # T1
+        for inputs, targets in val_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
 
             outputs, encoded_features = model(inputs)
             loss, mse, contrast, style = criterion(outputs, targets, encoded_features)
@@ -186,7 +177,6 @@ def validate(model, val_loader, criterion, device):
 
     return (val_loss / len(val_loader), val_mse / len(val_loader),
             val_contrast / len(val_loader), val_style / len(val_loader))
-
 
 def main():
     torch.manual_seed(42)
@@ -226,7 +216,6 @@ def main():
     torch.save(model.state_dict(), 'multi_scale_unet3d_model.pth')
 
     writer.close()
-
 
 if __name__ == '__main__':
     main()
