@@ -7,8 +7,9 @@ from tqdm import tqdm
 import os
 import json
 from sklearn.model_selection import train_test_split
-from model_multi_scale import SimplifiedUNet3D, CombinedLoss, min_max_normalization
+from model_multi_scale import MultiScaleUNet3D, MultiScaleLoss, normalize_with_percentile
 from dataset import BrainMRIDataset
+import torch.multiprocessing as mp
 
 def save_checkpoint(model, optimizer, epoch, loss, normalization_params, filename="checkpoint_multiscale.pth"):
     torch.save({
@@ -23,7 +24,7 @@ def save_checkpoint(model, optimizer, epoch, loss, normalization_params, filenam
 def load_checkpoint(model, optimizer, filename="checkpoint_multiscale.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
-        checkpoint = torch.load(filename)
+        checkpoint = torch.load(filename, map_location='cpu')
         start_epoch = checkpoint['epoch'] + 1
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -37,21 +38,24 @@ def load_checkpoint(model, optimizer, filename="checkpoint_multiscale.pth"):
 
 def visualize_results(writer, inputs, targets, outputs, epoch):
     slice_idx = inputs.shape[2] // 2
-    writer.add_image('Input/FLAIR', inputs[0, 0, slice_idx], epoch)
-    writer.add_image('Input/T1c', inputs[0, 1, slice_idx], epoch)
-    writer.add_image('Input/T2', inputs[0, 2, slice_idx], epoch)
-    writer.add_image('Target/T1', targets[0, 0, slice_idx], epoch)
-    writer.add_image('Output/T1', outputs[0, 0, slice_idx], epoch)
+    writer.add_image('Input/FLAIR', inputs[0, 0, slice_idx].cpu().numpy(), epoch)
+    writer.add_image('Input/T1c', inputs[0, 1, slice_idx].cpu().numpy(), epoch)
+    writer.add_image('Input/T2', inputs[0, 2, slice_idx].cpu().numpy(), epoch)
+    writer.add_image('Target/T1', targets[0, 0, slice_idx].cpu().numpy(), epoch)
+    writer.add_image('Output/T1', outputs[0, 0, slice_idx].cpu().numpy(), epoch)
 
 def main():
     torch.manual_seed(42)
     np.random.seed(42)
 
-    batch_size = 2
+    batch_size = 16  # Reduced batch size for CPU training
     num_epochs = 50
     learning_rate = 1e-4
     device = torch.device("cpu")
     print(f"Using device: {device}")
+
+    # Set up multiprocessing for CPU
+    mp.set_start_method('spawn', force=True)
 
     root_dir = '../data/PKG - UCSF-PDGM-v3-20230111/UCSF-PDGM-v3/'
     dataset = BrainMRIDataset(root_dir=root_dir)
@@ -61,14 +65,14 @@ def main():
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
     test_dataset = torch.utils.data.Subset(dataset, test_indices)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    model = SimplifiedUNet3D(in_channels=3, out_channels=1).to(device)
-    criterion = CombinedLoss().to(device)
+    model = MultiScaleUNet3D(in_channels=3, out_channels=1).to(device)
+    criterion = MultiScaleLoss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    writer = SummaryWriter('runs/simplified_multi_scale_unet')
+    writer = SummaryWriter('runs/multi_scale_unet')
 
     start_epoch, normalization_params = load_checkpoint(model, optimizer)
 
@@ -91,7 +95,7 @@ def main():
 
                 for j in range(num_modalities):
                     modality = modalities[i, j]
-                    normalized_modality, min_val, max_val = min_max_normalization(modality)
+                    normalized_modality, min_val, max_val = normalize_with_percentile(modality)
                     normalized_modalities[i, j] = normalized_modality
 
                     normalization_params[patient_id][f'modality_{j}'] = {'min': min_val, 'max': max_val}
@@ -99,13 +103,14 @@ def main():
             inputs = normalized_modalities[:, [0, 2, 3], :, :, :].to(device)  # FLAIR, T1c, T2
             targets = normalized_modalities[:, 1, :, :, :].unsqueeze(1).to(device)  # T1
 
-
-            print(f"Input shape: {inputs.shape}")  # Debugging print
-            print(f"Target shape: {targets.shape}")  # Debugging print
             optimizer.zero_grad()
 
-            outputs = model(inputs)
-            loss, mse, contrast, style = criterion(outputs, targets)
+            outputs, encoded_features = model(inputs)
+            loss, mse, contrast, style = criterion(outputs, targets, encoded_features)
+
+            if not torch.isfinite(loss):
+                print(f"Warning: non-finite loss, skipping batch {batch_idx}")
+                continue
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -137,7 +142,7 @@ def main():
             for batch_idx, (modalities, _) in enumerate(tqdm(test_loader, desc="Validation")):
                 normalized_modalities = []
                 for i in range(modalities.shape[1]):
-                    normalized_modality, _, _ = min_max_normalization(modalities[:, i])
+                    normalized_modality, _, _ = normalize_with_percentile(modalities[:, i])
                     normalized_modalities.append(normalized_modality)
 
                 modalities = torch.stack(normalized_modalities, dim=1)
@@ -145,8 +150,8 @@ def main():
                 inputs = modalities[:, [0, 2, 3], :, :, :].to(device)  # FLAIR, T1c, T2
                 targets = modalities[:, 1, :, :, :].unsqueeze(1).to(device)  # T1
 
-                outputs = model(inputs)
-                loss, _, _, _ = criterion(outputs, targets)
+                outputs, encoded_features = model(inputs)
+                loss, _, _, _ = criterion(outputs, targets, encoded_features)
                 val_loss += loss.item()
 
         val_loss /= len(test_loader)
@@ -159,7 +164,7 @@ def main():
         if (epoch + 1) % 10 == 0:
             save_checkpoint(model, optimizer, epoch, epoch_loss, normalization_params)
 
-    torch.save(model.state_dict(), 'simplified_unet3d_model_multi_scale.pth')
+    torch.save(model.state_dict(), 'multi_scale_unet3d_model.pth')
 
     avg_normalization_params = {}
     for modality in range(4):
@@ -175,8 +180,12 @@ def main():
 
     with open('avg_normalization_params_multi_scale.json', 'w') as f:
         json.dump(avg_normalization_params, f)
+    with open('avg_normalization_params_multi_scale.json', 'w') as f:
+        json.dump(avg_normalization_params, f)
 
     writer.close()
+
+    print("Training completed successfully!")
 
 if __name__ == '__main__':
     main()
