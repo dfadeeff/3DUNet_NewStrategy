@@ -11,6 +11,7 @@ from model_multi_scale import MultiScaleUNet3D, MultiScaleLoss, normalize_with_p
 from dataset import BrainMRIDataset
 import torch.multiprocessing as mp
 
+
 def save_checkpoint(model, optimizer, epoch, loss, normalization_params, filename="checkpoint_multiscale.pth"):
     torch.save({
         'epoch': epoch,
@@ -20,6 +21,7 @@ def save_checkpoint(model, optimizer, epoch, loss, normalization_params, filenam
         'normalization_params': normalization_params
     }, filename)
     print(f"Checkpoint saved: {filename}")
+
 
 def load_checkpoint(model, optimizer, filename="checkpoint_multiscale.pth"):
     if os.path.isfile(filename):
@@ -36,6 +38,7 @@ def load_checkpoint(model, optimizer, filename="checkpoint_multiscale.pth"):
         print(f"No checkpoint found at '{filename}'")
         return 0, {}
 
+
 def visualize_results(writer, inputs, targets, outputs, epoch):
     slice_idx = inputs.shape[2] // 2
     writer.add_image('Input/FLAIR', inputs[0, 0, slice_idx].cpu().numpy(), epoch)
@@ -44,11 +47,12 @@ def visualize_results(writer, inputs, targets, outputs, epoch):
     writer.add_image('Target/T1', targets[0, 0, slice_idx].cpu().numpy(), epoch)
     writer.add_image('Output/T1', outputs[0, 0, slice_idx].cpu().numpy(), epoch)
 
+
 def main():
     torch.manual_seed(42)
     np.random.seed(42)
 
-    batch_size = 16  # Reduced batch size for CPU training
+    batch_size = 4  # Reduced batch size for CPU training
     num_epochs = 50
     learning_rate = 1e-4
     device = torch.device("cpu")
@@ -83,7 +87,8 @@ def main():
         running_contrast = 0.0
         running_style = 0.0
 
-        for batch_idx, (modalities, patient_ids) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+        for batch_idx, (modalities, patient_ids) in enumerate(
+                tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
             batch_size, num_modalities, d, h, w = modalities.shape
             normalized_modalities = torch.zeros_like(modalities)
 
@@ -122,14 +127,16 @@ def main():
             running_style += style.item()
 
             if batch_idx % 10 == 0:
-                print(f"Batch {batch_idx}, Loss: {loss.item():.4f}, MSE: {mse.item():.4f}, Contrast: {contrast.item():.4f}, Style: {style.item():.4f}")
+                print(
+                    f"Batch {batch_idx}, Loss: {loss.item():.4f}, MSE: {mse.item():.4f}, Contrast: {contrast.item():.4f}, Style: {style.item():.4f}")
 
         epoch_loss = running_loss / len(train_loader)
         epoch_mse = running_mse / len(train_loader)
         epoch_contrast = running_contrast / len(train_loader)
         epoch_style = running_style / len(train_loader)
 
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Total Loss: {epoch_loss:.4f}, MSE: {epoch_mse:.4f}, Contrast: {epoch_contrast:.4f}, Style: {epoch_style:.4f}")
+        print(
+            f"Epoch [{epoch + 1}/{num_epochs}], Total Loss: {epoch_loss:.4f}, MSE: {epoch_mse:.4f}, Contrast: {epoch_contrast:.4f}, Style: {epoch_style:.4f}")
 
         writer.add_scalar('Training/Total Loss', epoch_loss, epoch)
         writer.add_scalar('Training/MSE Loss', epoch_mse, epoch)
@@ -186,6 +193,7 @@ def main():
     writer.close()
 
     print("Training completed successfully!")
+
 
 if __name__ == '__main__':
     main()
