@@ -1,3 +1,5 @@
+import json
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,6 +19,7 @@ class PatchBrainMRIDataset(Dataset):
         self.stride = stride
         self.data_list = self.parse_dataset()
         self.patches_info = self.create_patches_info()
+        self.normalization_params = {}  # Add this line
 
     def parse_dataset(self):
         data_list = []
@@ -73,7 +76,45 @@ class PatchBrainMRIDataset(Dataset):
         # T1 as target
         target_patch = patch_t1[np.newaxis, ...]
 
-        return torch.from_numpy(input_patch).float(), torch.from_numpy(target_patch).float()
+        # Convert to PyTorch tensors
+        input_patch = torch.from_numpy(input_patch).float()
+        target_patch = torch.from_numpy(target_patch).float()
+
+        input_patch, min_val, max_val = normalize_with_percentile(input_patch)
+        target_patch, target_min, target_max = normalize_with_percentile(target_patch)
+
+        # Store normalization parameters
+        patient_id = f"patient_{data_idx}"
+        if patient_id not in self.normalization_params:
+            self.normalization_params[patient_id] = {}
+        self.normalization_params[patient_id]['input'] = {'min': min_val, 'max': max_val}
+        self.normalization_params[patient_id]['target'] = {'min': target_min, 'max': target_max}
+
+        return input_patch, target_patch
+
+    def get_average_normalization_params(self):
+        if not self.normalization_params:
+            print("Warning: No normalization parameters available yet.")
+            return None
+
+        avg_params = {'input': {'min': 0, 'max': 0}, 'target': {'min': 0, 'max': 0}}
+        count = len(self.normalization_params)
+
+        for params in self.normalization_params.values():
+            avg_params['input']['min'] += params['input']['min']
+            avg_params['input']['max'] += params['input']['max']
+            avg_params['target']['min'] += params['target']['min']
+            avg_params['target']['max'] += params['target']['max']
+
+        avg_params['input']['min'] /= count
+        avg_params['input']['max'] /= count
+        avg_params['target']['min'] /= count
+        avg_params['target']['max'] /= count
+
+        return avg_params
+
+
+
 
 def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_multiscale.pth"):
     torch.save({
@@ -185,7 +226,7 @@ def main():
     # Hyperparameters
     batch_size = 4
     num_epochs = 50
-    learning_rate = 1e-4
+    learning_rate = 1e-5
     patch_size = (64, 64, 64)
     stride = (32, 32, 32)
 
@@ -194,6 +235,28 @@ def main():
 
     root_dir = '../data/PKG - UCSF-PDGM-v3-20230111/UCSF-PDGM-v3/'
     dataset = PatchBrainMRIDataset(root_dir, patch_size, stride)
+
+
+    # Process a small batch of data to populate normalization parameters
+    print("Processing initial batch to populate normalization parameters...")
+    initial_loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=1)
+    for _ in range(min(10, len(dataset))):  # Process up to 10 samples or the entire dataset if smaller
+        next(iter(initial_loader))
+
+    # Save normalization parameters
+    with open('patient_normalization_params_multi_scale.json', 'w') as f:
+        json.dump(dataset.normalization_params, f)
+
+    avg_normalization_params = dataset.get_average_normalization_params()
+    if avg_normalization_params is not None:
+        with open('avg_normalization_params_multi_scale.json', 'w') as f:
+            json.dump(avg_normalization_params, f)
+        print("Normalization parameters saved successfully!")
+    else:
+        print("No average normalization parameters available to save.")
+
+
+
 
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
@@ -206,6 +269,8 @@ def main():
     criterion = MultiScaleLoss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+
+
 
     writer = SummaryWriter('runs/multi_scale_unet_optimized')
 
