@@ -230,10 +230,11 @@ def main():
     patch_size = (64, 64, 64)
     stride = (32, 32, 32)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    root_dir = '../data/PKG - UCSF-PDGM-v3-20230111/UCSF-PDGM-v3/'
+    #root_dir = '../data/PKG - UCSF-PDGM-v3-20230111/UCSF-PDGM-v3/'
+    root_dir = '../data/UCSF-PDGM-v3/'
     dataset = PatchBrainMRIDataset(root_dir, patch_size, stride)
 
 
