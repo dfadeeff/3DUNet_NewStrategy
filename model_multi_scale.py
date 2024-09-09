@@ -38,51 +38,51 @@ class MultiScaleUNet3D(nn.Module):
         self.conv = nn.Conv3d(features, out_channels, kernel_size=1)
 
     def forward(self, x):
-        print(f"Input shape: {x.shape}")
+        #print(f"Input shape: {x.shape}")
         input_size = x.shape[2:]
 
         enc1 = self.encoder1(x)
-        print(f"Encoder 1 output shape: {enc1.shape}")
+        #print(f"Encoder 1 output shape: {enc1.shape}")
 
         enc2 = self.encoder2(self.pool1(enc1))
-        print(f"Encoder 2 output shape: {enc2.shape}")
+        #print(f"Encoder 2 output shape: {enc2.shape}")
 
         enc3 = self.encoder3(self.pool2(enc2))
-        print(f"Encoder 3 output shape: {enc3.shape}")
+        #print(f"Encoder 3 output shape: {enc3.shape}")
 
         middle = self.middle(self.pool3(enc3))
-        print(f"Middle output shape: {middle.shape}")
+        #print(f"Middle output shape: {middle.shape}")
 
         dec3 = self.upconv3(middle)
-        print(f"Upconv 3 output shape: {dec3.shape}")
+        #print(f"Upconv 3 output shape: {dec3.shape}")
         enc3 = F.interpolate(enc3, size=dec3.shape[2:], mode='trilinear', align_corners=False)
-        print(f"Interpolated Encoder 3 shape: {enc3.shape}")
+        #print(f"Interpolated Encoder 3 shape: {enc3.shape}")
         dec3 = torch.cat((dec3, enc3), dim=1)
         dec3 = self.decoder3(dec3)
-        print(f"Decoder 3 output shape: {dec3.shape}")
+        #print(f"Decoder 3 output shape: {dec3.shape}")
 
         dec2 = self.upconv2(dec3)
-        print(f"Upconv 2 output shape: {dec2.shape}")
+        #print(f"Upconv 2 output shape: {dec2.shape}")
         enc2 = F.interpolate(enc2, size=dec2.shape[2:], mode='trilinear', align_corners=False)
-        print(f"Interpolated Encoder 2 shape: {enc2.shape}")
+        #print(f"Interpolated Encoder 2 shape: {enc2.shape}")
         dec2 = torch.cat((dec2, enc2), dim=1)
         dec2 = self.decoder2(dec2)
-        print(f"Decoder 2 output shape: {dec2.shape}")
+        #print(f"Decoder 2 output shape: {dec2.shape}")
 
         dec1 = self.upconv1(dec2)
-        print(f"Upconv 1 output shape: {dec1.shape}")
+        #print(f"Upconv 1 output shape: {dec1.shape}")
         enc1 = F.interpolate(enc1, size=dec1.shape[2:], mode='trilinear', align_corners=False)
-        print(f"Interpolated Encoder 1 shape: {enc1.shape}")
+        #print(f"Interpolated Encoder 1 shape: {enc1.shape}")
         dec1 = torch.cat((dec1, enc1), dim=1)
         dec1 = self.decoder1(dec1)
-        print(f"Decoder 1 output shape: {dec1.shape}")
+        #print(f"Decoder 1 output shape: {dec1.shape}")
 
         output = self.conv(dec1)
-        print(f"Pre-final output shape: {output.shape}")
+        #print(f"Pre-final output shape: {output.shape}")
 
         # Final interpolation to match input size
         output = F.interpolate(output, size=input_size, mode='trilinear', align_corners=False)
-        print(f"Final output shape: {output.shape}")
+        #print(f"Final output shape: {output.shape}")
 
         return output, [enc1, enc2, enc3]
 

@@ -1,5 +1,4 @@
 import json
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,6 +10,9 @@ import os
 import SimpleITK as sitk
 from sklearn.model_selection import train_test_split
 from model_multi_scale import MultiScaleUNet3D, MultiScaleLoss, normalize_with_percentile
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 
 class PatchBrainMRIDataset(Dataset):
     def __init__(self, root_dir, patch_size=(64, 64, 64), stride=(32, 32, 32)):
@@ -237,7 +239,7 @@ def main():
     patch_size = (64, 64, 64)
     stride = (32, 32, 32)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     #root_dir = '../data/PKG - UCSF-PDGM-v3-20230111/UCSF-PDGM-v3/'
