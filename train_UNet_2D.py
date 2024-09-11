@@ -126,6 +126,28 @@ class BrainMRI2DDataset(Dataset):
         normalized_tensor = torch.clamp(normalized_tensor, 0, 1)
         return normalized_tensor, min_val.item(), max_val.item()
 
+    def get_full_slice(self, idx):
+        data_idx, slice_idx = self.slices_info[idx]
+        data_entry = self.data_list[data_idx]
+
+        # Load all modalities
+        flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))[slice_idx]
+        t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))[slice_idx]
+        t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))[slice_idx]
+        t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))[slice_idx]
+
+        # Stack input modalities
+        input_slice = np.stack([flair, t1c, t2], axis=0)
+        target_slice = t1[np.newaxis, ...]
+
+        input_slice = torch.from_numpy(input_slice).float()
+        target_slice = torch.from_numpy(target_slice).float()
+
+        input_slice, _, _ = self.normalize_with_percentile(input_slice)
+        target_slice, _, _ = self.normalize_with_percentile(target_slice)
+
+        return input_slice, target_slice
+
 
 def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     # Select the first item in the batch
@@ -161,10 +183,10 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 def visualize_full_image(inputs, targets, outputs, epoch, batch_idx, writer):
-    # Select the first item in the batch
+    # Ensure we're working with numpy arrays
     input_slices = inputs[0].cpu().numpy()
-    target_slice = targets[0, 0].cpu().numpy()
-    output_slice = outputs[0, 0].detach().cpu().numpy()
+    target_slice = targets[0].cpu().numpy()
+    output_slice = outputs[0].detach().cpu().numpy()
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
@@ -180,15 +202,15 @@ def visualize_full_image(inputs, targets, outputs, epoch, batch_idx, writer):
     axes[0, 2].set_title('T2')
     axes[0, 2].axis('off')
 
-    axes[1, 0].imshow(target_slice, cmap='gray')
+    axes[1, 0].imshow(target_slice[0], cmap='gray')
     axes[1, 0].set_title('Ground Truth T1')
     axes[1, 0].axis('off')
 
-    axes[1, 1].imshow(output_slice, cmap='gray')
+    axes[1, 1].imshow(output_slice[0], cmap='gray')
     axes[1, 1].set_title('Generated T1')
     axes[1, 1].axis('off')
 
-    difference = np.abs(target_slice - output_slice)
+    difference = np.abs(target_slice[0] - output_slice[0])
     axes[1, 2].imshow(difference, cmap='hot')
     axes[1, 2].set_title('Absolute Difference')
     axes[1, 2].axis('off')
@@ -237,7 +259,7 @@ class CombinedLoss(nn.Module):
         return self.alpha * mse_loss + (1 - self.alpha) * ssim_loss
 
 
-def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer):
+def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer, dataset):
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
@@ -271,7 +293,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
         writer.add_scalar('Training/PSNR', epoch_psnr, epoch)
         writer.add_scalar('Training/SSIM', epoch_ssim, epoch)
 
-        val_loss, val_psnr, val_ssim = validate(model, val_loader, criterion, device, epoch, writer)
+        val_loss, val_psnr, val_ssim = validate(model, val_loader, criterion, device, epoch, writer, dataset)
+
         print(f"Validation Loss: {val_loss:.4f}, PSNR: {val_psnr:.2f}, SSIM: {val_ssim:.4f}")
         writer.add_scalar('Validation/Loss', val_loss, epoch)
         writer.add_scalar('Validation/PSNR', val_psnr, epoch)
@@ -285,7 +308,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
     print("Training completed successfully!")
 
 
-def validate(model, val_loader, criterion, device, epoch, writer):
+def validate(model, val_loader, criterion, device, epoch, writer, dataset):
     model.eval()
     val_loss = 0.0
     val_psnr = 0.0
@@ -302,7 +325,10 @@ def validate(model, val_loader, criterion, device, epoch, writer):
 
             # Visualize full image for the first batch of each validation
             if batch_idx == 0:
-                visualize_full_image(inputs, targets, outputs, epoch, batch_idx, writer)
+                full_input, full_target = dataset.get_full_slice(val_loader.dataset.indices[0])
+                full_input = full_input.unsqueeze(0).to(device)
+                full_output = model(full_input)
+                visualize_full_image(full_input, full_target.unsqueeze(0), full_output, epoch, batch_idx, writer)
 
     return (val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader))
 
@@ -318,7 +344,7 @@ def main():
     patch_size = 128
     center_bias = 0.8  # 80% of patches from center, 20% from anywhere
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     root_dir = '../data/UCSF-PDGM-v3/'
@@ -341,11 +367,11 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
 
-    writer = SummaryWriter('runs/2d_unet_experiment')
+    writer = SummaryWriter('runs/2d_unet_experiment_full_image')
 
     start_epoch = load_checkpoint(model, optimizer)
 
-    train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs - start_epoch, device, writer)
+    train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs - start_epoch, device, writer, dataset)
 
     torch.save(model.state_dict(), '2d_unet_model_final.pth')
 
