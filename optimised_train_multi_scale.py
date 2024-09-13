@@ -10,7 +10,7 @@ from tqdm import tqdm
 import os
 import SimpleITK as sitk
 from sklearn.model_selection import train_test_split
-from model_multi_scale import MultiScaleUNet3D, MultiScaleLoss, normalize_with_percentile
+from model_UNet_3D_multi_scale import MultiScaleUNet3D, MultiScaleLoss, normalize_with_percentile
 
 class PatchBrainMRIDataset(Dataset):
     def __init__(self, root_dir, patch_size=(64, 64, 64), stride=(32, 32, 32)):
