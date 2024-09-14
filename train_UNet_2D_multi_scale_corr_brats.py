@@ -119,10 +119,16 @@ class BrainMRI2DDataset(Dataset):
 
         return input_patch, target_patch, idx
 
-    def normalize_with_percentile(self, tensor):
+    def normalize_with_percentile(self, tensor, epsilon=1e-7):
         min_val = torch.quantile(tensor, 0.01)
         max_val = torch.quantile(tensor, 0.99)
-        normalized_tensor = (tensor - min_val) / (max_val - min_val)
+        # Ensure min_val != max_val
+        if max_val - min_val < epsilon:
+            print(
+                f"Warning: max_val ({max_val}) and min_val ({min_val}) are too close. Adjusting to prevent division by zero.")
+            max_val = min_val + epsilon
+
+        normalized_tensor = (tensor - min_val) / (max_val - min_val + epsilon)
         normalized_tensor = torch.clamp(normalized_tensor, 0, 1)
         return normalized_tensor, min_val.item(), max_val.item()
 
@@ -321,6 +327,18 @@ def validate(model, val_loader, criterion, device, epoch, writer, dataset):
 
     with torch.no_grad():
         for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
+            # Check for NaN or Inf in inputs and targets
+            if torch.isnan(inputs).any() or torch.isinf(inputs).any():
+                print(f"NaN or Inf detected in inputs at batch {batch_idx}")
+            if torch.isnan(targets).any() or torch.isinf(targets).any():
+                print(f"NaN or Inf detected in targets at batch {batch_idx}")
+
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            # Check for NaN or Inf in outputs
+            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                print(f"NaN or Inf detected in outputs at batch {batch_idx}")
+
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)  # During evaluation, only outputs are returned
             loss = criterion(outputs, targets)
