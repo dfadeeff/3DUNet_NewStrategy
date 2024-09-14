@@ -252,7 +252,8 @@ def load_checkpoint(model, optimizer, filename="checkpoint_multiscale_2d_corr.pt
         return 0
 
 
-def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer, dataset):
+def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer, train_dataset,
+          val_dataset):
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
@@ -279,7 +280,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
                 visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer)
 
                 # Add full image visualization during training
-                full_input, full_target = dataset.get_full_slice(idx)
+                full_input, full_target = train_dataset.get_full_slice(idx)
                 full_input = full_input.unsqueeze(0).to(device)
                 model.eval()
                 with torch.no_grad():
@@ -383,7 +384,7 @@ def main():
     start_epoch = load_checkpoint(model, optimizer)
 
     train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs - start_epoch, device, writer,
-          train_dataset)
+          train_dataset, val_dataset)
 
     torch.save(model.state_dict(), '2d_unet_model_final_multi_scale_corr_brats.pth')
 
