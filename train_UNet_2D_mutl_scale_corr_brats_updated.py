@@ -12,7 +12,8 @@ import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 
 
 class BrainMRI2DDataset(Dataset):
