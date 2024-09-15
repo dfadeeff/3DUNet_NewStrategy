@@ -259,7 +259,7 @@ def validate(model, val_loader, criterion, device, epoch, writer, dataset):
     with torch.no_grad():
         for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs, _, _ = model(inputs, targets)
+            outputs = model(inputs)
 
             outputs_float = outputs.float().clamp(0, 1)
             targets_float = targets.float()
@@ -278,7 +278,6 @@ def validate(model, val_loader, criterion, device, epoch, writer, dataset):
                 val_ssim += ssim_value.item()
 
             if batch_idx == 0:
-                idx = indices[0]
                 visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer)
 
                 writer.add_histogram('Validation/InputHistogram', inputs, epoch)
