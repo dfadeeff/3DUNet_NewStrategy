@@ -283,7 +283,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
 
             # Remove duplicate optimizer.zero_grad() and forward pass
             optimizer.zero_grad()
-            with autocast():
+            with autocast(device_type='cuda'):
                 outputs, loss, side_outputs = model(inputs, targets)
 
             print(f"Output range: {outputs.min().item():.4f} to {outputs.max().item():.4f}")
@@ -422,7 +422,8 @@ def main():
     train_root_dir = '../data/brats18/train/combined/'
     val_root_dir = '../data/brats18/val/'
 
-    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'], config['patch_size'], config['center_bias'])
+    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'], config['patch_size'],
+                                      config['center_bias'])
     val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'], config['patch_size'], config['center_bias'])
 
     def collate_fn(batch):
@@ -431,8 +432,10 @@ def main():
         indices = [item[2] for item in batch]
         return inputs, targets, indices
 
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4,
+                              collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4,
+                            collate_fn=collate_fn)
 
     model = UNet2D(in_channels=3, out_channels=1, init_features=32).to(device)
     model.apply(init_weights)
@@ -445,7 +448,8 @@ def main():
 
     start_epoch = load_checkpoint(model, optimizer)
 
-    train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device, writer, train_dataset, val_dataset)
+    train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
+          writer, train_dataset, val_dataset)
 
     torch.save(model.state_dict(), '2d_unet_model_final_multi_scale_corr_brats_updated.pth')
 
@@ -453,6 +457,7 @@ def main():
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
+
 
 def init_weights(m):
     if isinstance(m, nn.Conv2d):
@@ -462,6 +467,7 @@ def init_weights(m):
     elif isinstance(m, nn.BatchNorm2d):
         nn.init.constant_(m.weight, 1)
         nn.init.constant_(m.bias, 0)
+
 
 if __name__ == '__main__':
     main()
