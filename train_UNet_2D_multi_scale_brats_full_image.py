@@ -95,7 +95,8 @@ class BrainMRI2DDataset(Dataset):
         min_val = torch.quantile(tensor, 0.01)
         max_val = torch.quantile(tensor, 0.99)
         if max_val - min_val < epsilon:
-            print(f"Warning: max_val ({max_val}) and min_val ({min_val}) are too close. Skipping this sample (Shape: {tensor.shape})")
+            print(
+                f"Warning: max_val ({max_val}) and min_val ({min_val}) are too close. Skipping this sample (Shape: {tensor.shape})")
             return None, min_val.item(), max_val.item()
 
         normalized_tensor = (tensor - min_val) / (max_val - min_val + epsilon)
@@ -287,6 +288,13 @@ def validate(model, val_loader, criterion, device, epoch, writer, dataset):
     return (val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader))
 
 
+def collate_fn(batch):
+    inputs = torch.stack([item[0] for item in batch], dim=0)
+    targets = torch.stack([item[1] for item in batch], dim=0)
+    indices = [item[2] for item in batch]
+    return inputs, targets, indices
+
+
 def main():
     torch.manual_seed(42)
     np.random.seed(42)
@@ -307,12 +315,6 @@ def main():
 
     train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'])
     val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'])
-
-    def collate_fn(batch):
-        inputs = torch.stack([item[0] for item in batch], dim=0)
-        targets = torch.stack([item[1] for item in batch], dim=0)
-        indices = [item[2] for item in batch]
-        return inputs, targets, indices
 
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4,
                               collate_fn=collate_fn)
