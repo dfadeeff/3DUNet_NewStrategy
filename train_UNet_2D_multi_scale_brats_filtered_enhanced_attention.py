@@ -155,7 +155,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
 
 
 def save_checkpoint(model, optimizer, epoch, loss,
-                    filename="checkpoint_2d_multi_scale_brats_filtered_enhanced_attention.pth"):
+                    filename="checkpoint_2d_multi_scale_brats_filtered_enhanced_attentionv2.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -165,7 +165,7 @@ def save_checkpoint(model, optimizer, epoch, loss,
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_multi_scale_brats_filtered_enhanced_attention.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_multi_scale_brats_filtered_enhanced_attentionv2.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -281,7 +281,8 @@ def validate(generator, val_loader, criterion, device, epoch, writer):
 def train(generator, discriminator, train_loader, val_loader, criterion, g_optimizer, d_optimizer, g_scheduler,
           d_scheduler, num_epochs, device, writer):
     scaler = GradScaler()
-    best_val_loss = float('inf')
+    best_psnr = 0
+    best_ssim = 0
     patience = 10
     patience_counter = 0
 
@@ -305,19 +306,18 @@ def train(generator, discriminator, train_loader, val_loader, criterion, g_optim
         writer.add_scalar('Validation/PSNR', val_psnr, epoch)
         writer.add_scalar('Validation/SSIM', val_ssim, epoch)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Save model if PSNR or SSIM improves
+        if val_psnr > best_psnr or val_ssim > best_ssim:
+            best_psnr = max(val_psnr, best_psnr)
+            best_ssim = max(val_ssim, best_ssim)
             patience_counter = 0
-            save_checkpoint(generator, g_optimizer, epoch, val_loss, filename="best_model_checkpoint_enhanced.pth")
+            save_checkpoint(generator, g_optimizer, epoch, val_loss)
         else:
             patience_counter += 1
 
         if patience_counter >= patience:
             print(f"Early stopping triggered after {epoch + 1} epochs")
             break
-
-        if (epoch + 1) % 10 == 0:
-            save_checkpoint(generator, g_optimizer, epoch, train_loss)
 
     print("Training completed successfully!")
 
@@ -338,7 +338,7 @@ def main():
 
     config = {
         'batch_size': 16,
-        'num_epochs': 200,
+        'num_epochs': 100,
         'learning_rate': 1e-3,
         'slice_range': (2, 150),
         'weight_decay': 1e-5,
@@ -375,7 +375,7 @@ def main():
     d_scheduler = OneCycleLR(d_optimizer, max_lr=config['learning_rate'], steps_per_epoch=steps_per_epoch,
                              epochs=config['num_epochs'], pct_start=0.3)
 
-    writer = SummaryWriter('runs/2d_unet_experiment_brats_filtered_enhanced_attention')
+    writer = SummaryWriter('runs/2d_unet_experiment_brats_filtered_enhanced_attention_v2')
 
     start_epoch = load_checkpoint(generator, g_optimizer)
 
@@ -383,10 +383,10 @@ def main():
           d_scheduler,
           config['num_epochs'] - start_epoch, device, writer)
 
-    torch.save(generator.state_dict(), '2d_unet_model_multi_scale_brats_filtered_enhanced_attention.pth')
-    torch.save(discriminator.state_dict(), '2d_unet_discriminator_brats_filtered_enhanced_attention.pth')
+    torch.save(generator.state_dict(), '2d_unet_model_multi_scale_brats_filtered_enhanced_attentionv2.pth')
+    torch.save(discriminator.state_dict(), '2d_unet_discriminator_brats_filtered_enhanced_attentionv2.pth')
 
-    with open('patient_normalization_params_2d_multi_scale_brats_filtered_enhanced_attention.json', 'w') as f:
+    with open('patient_normalization_params_2d_multi_scale_brats_filtered_enhanced_attentionv2.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()

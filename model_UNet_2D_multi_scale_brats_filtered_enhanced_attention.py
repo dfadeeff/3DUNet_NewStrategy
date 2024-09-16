@@ -155,19 +155,23 @@ class UNet2D(nn.Module):
             losses = []
             weights = self.softmax(self.scale_weights)
             epsilon = 1e-8
-            for i, (side_output, weight) in enumerate(zip(
-                    [side_out7, side_out6, side_out5, side_out4, side_out3, side_out2, side_out1, out], weights)):
+            side_outputs = [side_out7, side_out6, side_out5, side_out4, side_out3, side_out2, side_out1, out]
+            for i, (side_output, weight) in enumerate(zip(side_outputs, weights)):
                 side_output = side_output.clamp(0 + epsilon, 1 - epsilon)
                 target_clamped = target.clamp(0 + epsilon, 1 - epsilon)
+
+                # Emphasize PSNR and SSIM
                 mse_loss = F.mse_loss(side_output, target_clamped)
                 ssim_loss = 1 - ssim(side_output, target_clamped, data_range=1.0, size_average=True)
-                psnr_loss = -calculate_psnr(side_output, target_clamped)
-                total_loss = mse_loss + 0.1 * ssim_loss + 0.01 * psnr_loss
+                psnr = calculate_psnr(side_output, target_clamped)
+
+                # Adjust weights to prioritize PSNR and SSIM
+                total_loss = 0.5 * mse_loss + 0.3 * ssim_loss - 0.2 * psnr  # Negative sign to maximize PSNR
                 losses.append(total_loss * weight)
 
             # Apply content and style losses only on the final output
             content_loss, style_loss = self.vgg_loss(out, target_clamped)
-            final_loss = losses[-1] + 0.1 * (content_loss + style_loss)
+            final_loss = losses[-1] + 0.05 * content_loss + 0.05 * style_loss
             losses[-1] = final_loss
 
             total_loss = sum(losses)
@@ -222,11 +226,12 @@ class VGGLoss(nn.Module):
         return gram.div(c * h * w)
 
 
-def calculate_psnr(img1, img2, data_range=1.0, eps=1e-8):
-    mse = torch.mean((img1 - img2) ** 2)
-    if mse < eps:
-        return torch.tensor(float('inf'))
-    return 20 * torch.log10(data_range / (torch.sqrt(mse) + eps))
+def calculate_psnr(img1, img2, max_val=1.0):
+    mse = F.mse_loss(img1, img2)
+    if mse == 0:
+        return 100.0
+    return 20 * torch.log10(max_val / torch.sqrt(mse))
+
 
 class EnhancedCombinedLoss(nn.Module):
     def __init__(self, alpha=0.84, vgg_weight=0.1, adversarial_weight=0.001, epsilon=1e-6):
@@ -321,6 +326,7 @@ def test_model():
     print(f"EnhancedCombinedLoss: {loss.item():.4f}")
 
     print("\nTest completed successfully!")
+
 
 if __name__ == "__main__":
     test_model()
