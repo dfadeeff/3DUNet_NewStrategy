@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_UNet_2D_multi_scale_corr_brats import UNet2D, calculate_psnr, CombinedLoss
+from model_UNet_2D_multi_scale_brats_filtered import UNet2D, calculate_psnr, CombinedLoss
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
@@ -305,13 +305,13 @@ def main():
 
     config = {
         'batch_size': 16,
-        'num_epochs': 10,
+        'num_epochs': 200,
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
         'weight_decay': 1e-5,
     }
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
