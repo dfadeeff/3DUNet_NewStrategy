@@ -195,11 +195,11 @@ def train_epoch(generator, discriminator, train_loader, g_optimizer, d_optimizer
         d_optimizer.zero_grad()
         with autocast(device_type='cuda'):
             real_output = discriminator(targets)
-            d_real_loss = F.binary_cross_entropy(real_output, torch.ones_like(real_output))
+            d_real_loss = F.binary_cross_entropy_with_logits(real_output, torch.ones_like(real_output))
 
             fake_images = generator(inputs)
             fake_output = discriminator(fake_images.detach())
-            d_fake_loss = F.binary_cross_entropy(fake_output, torch.zeros_like(fake_output))
+            d_fake_loss = F.binary_cross_entropy_with_logits(fake_output, torch.zeros_like(fake_output))
 
             d_loss = (d_real_loss + d_fake_loss) / 2
 
@@ -221,7 +221,8 @@ def train_epoch(generator, discriminator, train_loader, g_optimizer, d_optimizer
 
         running_loss += loss.item()
         psnr = calculate_psnr(gen_output, targets)
-        ssim_value = ssim(gen_output.clamp(0, 1), targets, data_range=1.0, size_average=True)
+
+        ssim_value = ssim(gen_output.clamp(0, 1).float(), targets.float(), data_range=1.0, size_average=True)
 
         running_psnr += psnr.item()
         running_ssim += ssim_value.item()
@@ -343,7 +344,7 @@ def main():
         'weight_decay': 1e-5,
     }
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
