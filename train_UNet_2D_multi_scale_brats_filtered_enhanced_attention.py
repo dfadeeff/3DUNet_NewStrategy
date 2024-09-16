@@ -154,7 +154,8 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_multi_scale_brats_filtered_enhanced.pth"):
+def save_checkpoint(model, optimizer, epoch, loss,
+                    filename="checkpoint_2d_multi_scale_brats_filtered_enhanced_attention.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -164,7 +165,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_multi
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_multi_scale_brats_filtered_enhanced.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_multi_scale_brats_filtered_enhanced_attention.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -192,7 +193,7 @@ def train_epoch(generator, discriminator, train_loader, g_optimizer, d_optimizer
 
         # Train Discriminator
         d_optimizer.zero_grad()
-        with autocast():
+        with autocast(device_type='cuda'):
             real_output = discriminator(targets)
             d_real_loss = F.binary_cross_entropy(real_output, torch.ones_like(real_output))
 
@@ -207,11 +208,11 @@ def train_epoch(generator, discriminator, train_loader, g_optimizer, d_optimizer
 
         # Train Generator
         g_optimizer.zero_grad()
-        with autocast():
+        with autocast(device_type='cuda'):
             gen_output = generator(inputs)
             fake_output = discriminator(gen_output)
 
-            loss, mse_loss, vgg_loss, adv_loss = criterion(gen_output, targets, fake_output)
+            loss = criterion(gen_output, targets, fake_output)
 
         scaler.scale(loss).backward()
         scaler.step(g_optimizer)
@@ -228,9 +229,6 @@ def train_epoch(generator, discriminator, train_loader, g_optimizer, d_optimizer
         if batch_idx % 100 == 0:
             writer.add_scalar('Training/GeneratorLoss', loss.item(), epoch * len(train_loader) + batch_idx)
             writer.add_scalar('Training/DiscriminatorLoss', d_loss.item(), epoch * len(train_loader) + batch_idx)
-            writer.add_scalar('Training/MSELoss', mse_loss.item(), epoch * len(train_loader) + batch_idx)
-            writer.add_scalar('Training/VGGLoss', vgg_loss.item(), epoch * len(train_loader) + batch_idx)
-            writer.add_scalar('Training/AdversarialLoss', adv_loss.item(), epoch * len(train_loader) + batch_idx)
 
     epoch_loss = running_loss / len(train_loader)
     epoch_psnr = running_psnr / len(train_loader)
@@ -239,8 +237,8 @@ def train_epoch(generator, discriminator, train_loader, g_optimizer, d_optimizer
     return epoch_loss, epoch_psnr, epoch_ssim
 
 
-def validate(model, val_loader, criterion, device, epoch, writer):
-    model.eval()
+def validate(generator, val_loader, criterion, device, epoch, writer):
+    generator.eval()
     val_loss = 0.0
     val_psnr = 0.0
     val_ssim = 0.0
@@ -248,7 +246,10 @@ def validate(model, val_loader, criterion, device, epoch, writer):
     with torch.no_grad():
         for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
+            outputs = generator(inputs)
+
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]  # Get the main output if the model returns multiple outputs
 
             outputs_float = outputs.float().clamp(0, 1)
             targets_float = targets.float()
@@ -276,17 +277,21 @@ def validate(model, val_loader, criterion, device, epoch, writer):
     return (val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader))
 
 
-def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer):
+def train(generator, discriminator, train_loader, val_loader, criterion, g_optimizer, d_optimizer, g_scheduler,
+          d_scheduler, num_epochs, device, writer):
     scaler = GradScaler()
     best_val_loss = float('inf')
     patience = 10
     patience_counter = 0
 
     for epoch in range(num_epochs):
-        train_loss, train_psnr, train_ssim = train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler,
-                                                         device, epoch, writer)
+        train_loss, train_psnr, train_ssim = train_epoch(generator, discriminator, train_loader, g_optimizer,
+                                                         d_optimizer, criterion, device, epoch, writer, scaler)
 
-        val_loss, val_psnr, val_ssim = validate(model, val_loader, criterion, device, epoch, writer)
+        g_scheduler.step()
+        d_scheduler.step()
+
+        val_loss, val_psnr, val_ssim = validate(generator, val_loader, criterion, device, epoch, writer)
 
         print(f"Epoch [{epoch + 1}/{num_epochs}]")
         print(f"Train - Loss: {train_loss:.4f}, PSNR: {train_psnr:.2f}, SSIM: {train_ssim:.4f}")
@@ -302,7 +307,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, epoch, val_loss, filename="best_model_checkpoint_enhanced.pth")
+            save_checkpoint(generator, g_optimizer, epoch, val_loss, filename="best_model_checkpoint_enhanced.pth")
         else:
             patience_counter += 1
 
@@ -311,7 +316,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
             break
 
         if (epoch + 1) % 10 == 0:
-            save_checkpoint(model, optimizer, epoch, train_loss)
+            save_checkpoint(generator, g_optimizer, epoch, train_loss)
 
     print("Training completed successfully!")
 
@@ -338,7 +343,7 @@ def main():
         'weight_decay': 1e-5,
     }
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -351,28 +356,36 @@ def main():
                               pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
-    model = UNet2D(in_channels=3, out_channels=1, init_features=32).to(device)
+    generator = UNet2D(in_channels=3, out_channels=1, init_features=32).to(device)
+    discriminator = Discriminator(in_channels=1).to(device)
 
     # Apply weight initialization
-    model.apply(init_weights)
+    generator.apply(init_weights)
+    discriminator.apply(init_weights)
 
     criterion = EnhancedCombinedLoss().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    g_optimizer = optim.Adam(generator.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    d_optimizer = optim.Adam(discriminator.parameters(), lr=config['learning_rate'],
+                             weight_decay=config['weight_decay'])
 
     steps_per_epoch = len(train_loader)
-    scheduler = OneCycleLR(optimizer, max_lr=config['learning_rate'], steps_per_epoch=steps_per_epoch,
-                           epochs=config['num_epochs'], pct_start=0.3)
+    g_scheduler = OneCycleLR(g_optimizer, max_lr=config['learning_rate'], steps_per_epoch=steps_per_epoch,
+                             epochs=config['num_epochs'], pct_start=0.3)
+    d_scheduler = OneCycleLR(d_optimizer, max_lr=config['learning_rate'], steps_per_epoch=steps_per_epoch,
+                             epochs=config['num_epochs'], pct_start=0.3)
 
-    writer = SummaryWriter('runs/2d_unet_experiment_brats_filtered_enhanced')
+    writer = SummaryWriter('runs/2d_unet_experiment_brats_filtered_enhanced_attention')
 
-    start_epoch = load_checkpoint(model, optimizer)
+    start_epoch = load_checkpoint(generator, g_optimizer)
 
-    train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
-          writer)
+    train(generator, discriminator, train_loader, val_loader, criterion, g_optimizer, d_optimizer, g_scheduler,
+          d_scheduler,
+          config['num_epochs'] - start_epoch, device, writer)
 
-    torch.save(model.state_dict(), '2d_unet_model_multi_scale_brats_filtered_enhanced.pth')
+    torch.save(generator.state_dict(), '2d_unet_model_multi_scale_brats_filtered_enhanced_attention.pth')
+    torch.save(discriminator.state_dict(), '2d_unet_discriminator_brats_filtered_enhanced_attention.pth')
 
-    with open('patient_normalization_params_2d_multi_scale_brats_filtered_enhanced.json', 'w') as f:
+    with open('patient_normalization_params_2d_multi_scale_brats_filtered_enhanced_attention.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
