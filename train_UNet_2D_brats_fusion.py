@@ -314,8 +314,8 @@ def validate(model, val_loader, criterion, device, epoch, writer):
             loss, _, _, _ = criterion(outputs, targets)
 
             val_loss += loss.item()
-            psnr = calculate_psnr(outputs, targets)
-            ssim_value = ssim(outputs, targets, data_range=1.0, size_average=True)
+            psnr = calculate_psnr(outputs[-1], targets)  # Use the highest resolution output
+            ssim_value = ssim(outputs[-1], targets, data_range=1.0, size_average=True)
             val_psnr += psnr.item()
             val_ssim += ssim_value.item()
 
@@ -323,7 +323,7 @@ def validate(model, val_loader, criterion, device, epoch, writer):
                 visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer)
 
                 writer.add_histogram('Validation/InputHistogram', inputs, epoch)
-                writer.add_histogram('Validation/OutputHistogram', outputs, epoch)
+                writer.add_histogram('Validation/OutputHistogram', outputs[-1], epoch)  # Use the highest resolution output
                 writer.add_histogram('Validation/TargetHistogram', targets, epoch)
 
     return val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader)

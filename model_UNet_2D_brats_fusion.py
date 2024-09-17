@@ -192,6 +192,7 @@ class EnhancedUNet(nn.Module):
         return [out4, out3, out2, out1]
 
 def calculate_psnr(img1, img2, max_val=1.0):
+    assert img1.shape == img2.shape, "Images must have the same dimensions"
     mse = torch.mean((img1 - img2) ** 2)
     return 20 * torch.log10(max_val / torch.sqrt(mse))
 
