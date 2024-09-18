@@ -137,7 +137,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     # Select the first item in the batch
     input_slices = inputs[0].cpu().numpy()
     target_slice = targets[0, 0].cpu().numpy()
-    output_slice = outputs['final_output'][0, 0].detach().cpu().numpy()
+    output_slice = outputs[0, 0].detach().cpu().numpy()  # Changed this line
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
@@ -171,7 +171,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_fusionv3.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_vitV1.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -181,7 +181,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_fusio
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_fusionv3.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_vitV1.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -312,7 +312,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, epoch, val_loss, filename="best_model_2d_fusionv3.pth")
+            save_checkpoint(model, optimizer, epoch, val_loss)
         else:
             patience_counter += 1
 
@@ -332,8 +332,8 @@ def main():
 
     config = {
         'batch_size': 16,
-        'num_epochs': 200,
-        'learning_rate': 1e-4,
+        'num_epochs': 50,
+        'learning_rate': 1e-5,
         'slice_range': (2, 150),
         'weight_decay': 1e-5,
     }
@@ -365,9 +365,9 @@ def main():
     train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
           writer)
 
-    torch.save(model.state_dict(), '2d_unet_model_brats_vitpth')
+    torch.save(model.state_dict(), '2d_unet_model_brats_vitV1.pth')
 
-    with open('patient_normalization_params_2d_brats_vit.json', 'w') as f:
+    with open('patient_normalization_params_2d_brats_vitV1.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
