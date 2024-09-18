@@ -153,7 +153,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_ms_brats_filtered_upgraded.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -163,7 +163,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_ms_br
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_ms_brats_filtered_upgraded.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_se.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -260,7 +260,7 @@ def validate(model, val_loader, criterion, device, epoch, writer):
 def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer):
     scaler = GradScaler()
     best_val_loss = float('inf')
-    patience = 10
+    patience = 30
     patience_counter = 0
 
     for epoch in range(num_epochs):
@@ -330,16 +330,16 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
     scheduler = CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
 
-    writer = SummaryWriter('runs/2d_unet_experiment_ms_brats_filtered_upgraded')
+    writer = SummaryWriter('runs/2d_unet_se')
 
     start_epoch = load_checkpoint(model, optimizer)
 
     train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
           writer)
 
-    torch.save(model.state_dict(), '2d_unet_model_ms_brats_filtered_upgraded.pth')
+    torch.save(model.state_dict(), '2d_unet_model_se.pth')
 
-    with open('patient_normalization_params_2d_ms_brats_filtered_upgraded.json', 'w') as f:
+    with open('patient_normalization_params_2d_se.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
