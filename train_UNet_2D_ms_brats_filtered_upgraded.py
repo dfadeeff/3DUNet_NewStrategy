@@ -1,20 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import transforms, datasets, models
 from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_UNet_2D_brats_vit import ViTMRISynthesis, calculate_psnr, VGGLoss
+from model_UNet_2D_multi_scale_brats_filtered import UNet2D, calculate_psnr, CombinedLoss
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 
 
 class BrainMRI2DDataset(Dataset):
@@ -93,51 +92,34 @@ class BrainMRI2DDataset(Dataset):
         input_slice = torch.from_numpy(input_slice).float()
         target_slice = torch.from_numpy(target_slice).float()
 
-        # Normalize input and target with min-max
-        # input_slice, input_min, input_max = self.normalize_slice(input_slice)
-        # target_slice, target_min, target_max = self.normalize_slice(target_slice)
-
         # Normalize input and target
-        input_slice, input_mean, input_std = self.normalize_slice(input_slice)
-        target_slice, target_mean, target_std = self.normalize_slice(target_slice)
+        input_slice, input_min, input_max = self.normalize_slice(input_slice)
+        target_slice, target_min, target_max = self.normalize_slice(target_slice)
 
         patient_id = f"patient_{data_idx}"
         if patient_id not in self.normalization_params:
             self.normalization_params[patient_id] = {}
-
-        # self.normalization_params[patient_id]['input'] = {'min': input_min, 'max': input_max}
-        # self.normalization_params[patient_id]['target'] = {'min': target_min, 'max': target_max}
-
-        self.normalization_params[patient_id]['input'] = {'mean': input_mean, 'std': input_std}
-        self.normalization_params[patient_id]['target'] = {'mean': target_mean, 'std': target_std}
+        self.normalization_params[patient_id]['input'] = {'min': input_min, 'max': input_max}
+        self.normalization_params[patient_id]['target'] = {'min': target_min, 'max': target_max}
 
         return input_slice, target_slice, idx
 
-    # def normalize_slice(self, tensor, epsilon=1e-7):
-    #     min_val = torch.min(tensor)
-    #     max_val = torch.max(tensor)
-    #     if max_val - min_val < epsilon:
-    #         return tensor, min_val.item(), max_val.item()
-    #     normalized_tensor = (tensor - min_val) / (max_val - min_val + epsilon)
-    #     return normalized_tensor, min_val.item(), max_val.item()
-
     def normalize_slice(self, tensor, epsilon=1e-7):
-        mean = torch.mean(tensor)
-        std = torch.std(tensor)
-        if std < epsilon:
-            return tensor, mean.item(), std.item()
-        normalized_tensor = (tensor - mean) / (std + epsilon)
-        return normalized_tensor, mean.item(), std.item()
+        min_val = torch.min(tensor)
+        max_val = torch.max(tensor)
+        if max_val - min_val < epsilon:
+            return tensor, min_val.item(), max_val.item()
+        normalized_tensor = (tensor - min_val) / (max_val - min_val + epsilon)
+        return normalized_tensor, min_val.item(), max_val.item()
 
     def get_full_slice(self, idx):
         return self.__getitem__(idx)
 
 
 def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
-    # Select the first item in the batch
     input_slices = inputs[0].cpu().numpy()
     target_slice = targets[0, 0].cpu().numpy()
-    output_slice = outputs['final_output'][0, 0].detach().cpu().numpy()
+    output_slice = outputs[0, 0].detach().cpu().numpy().clip(0, 1)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
@@ -171,7 +153,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_fusionv3.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_multi_scale_brats_filtered.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -181,7 +163,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_fusio
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_fusionv3.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_multi_scale_brats_filtered.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -196,60 +178,40 @@ def load_checkpoint(model, optimizer, filename="checkpoint_2d_fusionv3.pth"):
         return 0
 
 
-class VITLoss(nn.Module):
-    def __init__(self, alpha=0.84, vgg_weight=0.1, content_weight=0.5, style_weight=0.5):
-        super(VITLoss, self).__init__()
-        self.alpha = alpha
-        self.vgg_weight = vgg_weight
-        self.content_weight = content_weight
-        self.style_weight = style_weight
-        self.mse_loss = nn.MSELoss()
-        self.vgg_loss = VGGLoss()
-
-    def forward(self, pred, target):
-        mse_loss = self.mse_loss(pred, target)
-        ssim_loss = 1 - ssim(pred, target, data_range=1.0, size_average=True)
-        content_loss, style_loss = self.vgg_loss(pred, target)
-
-        # Combine content and style losses
-        vgg_loss = self.content_weight * content_loss + self.style_weight * style_loss
-
-        total_loss = self.alpha * mse_loss + (1 - self.alpha) * ssim_loss + self.vgg_weight * vgg_loss
-        return total_loss, mse_loss.item(), ssim_loss.item(), vgg_loss.item()
-
-
 def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, epoch, writer):
     model.train()
     running_loss = 0.0
     running_psnr = 0.0
     running_ssim = 0.0
 
-    for batch_idx, (inputs, targets, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
+    for batch_idx, (inputs, targets, indices) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
         inputs, targets = inputs.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-            outputs = model(inputs)
-            loss, mse_loss, ssim_loss, vgg_loss = criterion(outputs, targets)
+        with autocast(device_type='cuda'):
+            outputs, loss, _ = model(inputs, targets)
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
 
         running_loss += loss.item()
-        psnr = calculate_psnr(outputs, targets)
-        ssim_value = ssim(outputs.float(), targets.float(), data_range=1.0, size_average=True)
-        running_psnr += psnr.item()
-        running_ssim += ssim_value.item()
+
+        outputs_float = outputs.float()
+        targets_float = targets.float()
+
+        psnr = calculate_psnr(outputs_float, targets_float)
+        ssim_value = ssim(outputs_float.clamp(0, 1), targets_float.clamp(0, 1), data_range=1.0, size_average=True)
+
+        if not torch.isnan(psnr) and not torch.isinf(psnr):
+            running_psnr += psnr.item()
+        if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
+            running_ssim += ssim_value.item()
 
         if batch_idx % 10 == 0:
             visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer)
-            writer.add_scalar('Training/BatchLoss', loss.item(), epoch * len(train_loader) + batch_idx)
-            writer.add_scalar('Training/MSELoss', mse_loss, epoch * len(train_loader) + batch_idx)
-            writer.add_scalar('Training/SSIMLoss', ssim_loss, epoch * len(train_loader) + batch_idx)
-            writer.add_scalar('Training/VGGLoss', vgg_loss, epoch * len(train_loader) + batch_idx)
-
-    scheduler.step()
 
     epoch_loss = running_loss / len(train_loader)
     epoch_psnr = running_psnr / len(train_loader)
@@ -265,16 +227,25 @@ def validate(model, val_loader, criterion, device, epoch, writer):
     val_ssim = 0.0
 
     with torch.no_grad():
-        for batch_idx, (inputs, targets, _) in enumerate(val_loader):
+        for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
-            loss, _, _, _ = criterion(outputs, targets)
 
-            val_loss += loss.item()
-            psnr = calculate_psnr(outputs, targets)
-            ssim_value = ssim(outputs, targets, data_range=1.0, size_average=True)
-            val_psnr += psnr.item()
-            val_ssim += ssim_value.item()
+            outputs_float = outputs.float().clamp(0, 1)
+            targets_float = targets.float()
+
+            loss = criterion(outputs_float, targets_float)
+
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                val_loss += loss.item()
+
+            psnr = calculate_psnr(outputs_float, targets_float)
+            ssim_value = ssim(outputs_float, targets_float, data_range=1.0, size_average=True)
+
+            if not torch.isnan(psnr) and not torch.isinf(psnr):
+                val_psnr += psnr.item()
+            if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
+                val_ssim += ssim_value.item()
 
             if batch_idx == 0:
                 visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer)
@@ -283,7 +254,7 @@ def validate(model, val_loader, criterion, device, epoch, writer):
                 writer.add_histogram('Validation/OutputHistogram', outputs, epoch)
                 writer.add_histogram('Validation/TargetHistogram', targets, epoch)
 
-    return val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader)
+    return (val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader))
 
 
 def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer):
@@ -309,10 +280,12 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
         writer.add_scalar('Validation/PSNR', val_psnr, epoch)
         writer.add_scalar('Validation/SSIM', val_ssim, epoch)
 
+        scheduler.step()
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, epoch, val_loss, filename="best_model_2d_fusionv3.pth")
+            save_checkpoint(model, optimizer, epoch, val_loss, filename="best_model_checkpoint.pth")
         else:
             patience_counter += 1
 
@@ -351,23 +324,22 @@ def main():
                               pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
-    model = ViTMRISynthesis(img_size=240, patch_size=16, in_chans=3, out_chans=1,
-                            embed_dim=768, depth=12, num_heads=12, mlp_ratio=4).to(device)
-    criterion = VITLoss(alpha=0.84, vgg_weight=0.1, content_weight=0.5, style_weight=0.5).to(device)
-    optimizer = optim.Adam(list(model.parameters()) + list(criterion.parameters()), lr=config['learning_rate'],
-                           weight_decay=config['weight_decay'])
+    model = UNet2D(in_channels=3, out_channels=1, init_features=32).to(device)
+
+    criterion = CombinedLoss().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
     scheduler = CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
 
-    writer = SummaryWriter('runs/2d_unet_experiment_brats_vit')
+    writer = SummaryWriter('runs/2d_unet_experiment_brats_filtered')
 
     start_epoch = load_checkpoint(model, optimizer)
 
     train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
           writer)
 
-    torch.save(model.state_dict(), '2d_unet_model_brats_vitpth')
+    torch.save(model.state_dict(), '2d_unet_model_multi_scale_brats_filtered.pth')
 
-    with open('patient_normalization_params_2d_brats_vit.json', 'w') as f:
+    with open('patient_normalization_params_2d_multi_scale_brats_filtered.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
