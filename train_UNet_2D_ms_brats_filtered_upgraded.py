@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
-from torch.cuda.amp import GradScaler
-from torch.amp import autocast
+from torch.amp import GradScaler, autocast
+
 
 
 class BrainMRI2DDataset(Dataset):
@@ -153,7 +153,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_multi_scale_brats_filtered.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_ms_brats_filtered_upgraded.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -163,7 +163,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_multi
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_multi_scale_brats_filtered.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_ms_brats_filtered_upgraded.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -285,7 +285,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, epoch, val_loss, filename="best_model_checkpoint.pth")
+            save_checkpoint(model, optimizer, epoch, val_loss)
         else:
             patience_counter += 1
 
@@ -305,7 +305,7 @@ def main():
 
     config = {
         'batch_size': 16,
-        'num_epochs': 200,
+        'num_epochs': 50,
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
         'weight_decay': 1e-5,
@@ -330,16 +330,16 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
     scheduler = CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
 
-    writer = SummaryWriter('runs/2d_unet_experiment_brats_filtered')
+    writer = SummaryWriter('runs/2d_unet_experiment_ms_brats_filtered_upgraded')
 
     start_epoch = load_checkpoint(model, optimizer)
 
     train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
           writer)
 
-    torch.save(model.state_dict(), '2d_unet_model_multi_scale_brats_filtered.pth')
+    torch.save(model.state_dict(), '2d_unet_model_ms_brats_filtered_upgraded.pth')
 
-    with open('patient_normalization_params_2d_multi_scale_brats_filtered.json', 'w') as f:
+    with open('patient_normalization_params_2d_ms_brats_filtered_upgraded.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()

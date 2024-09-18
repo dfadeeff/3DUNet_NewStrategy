@@ -5,6 +5,24 @@ from torchvision.models import vgg19, VGG19_Weights
 from pytorch_msssim import ssim
 
 
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dropout_rate=0.1):
         super(ConvBlock, self).__init__()
@@ -19,10 +37,10 @@ class ConvBlock(nn.Module):
             nn.Dropout2d(dropout_rate)
         )
         self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+        self.se = SEBlock(out_channels)
 
     def forward(self, x):
-        return self.conv(x) + self.residual(x)
-
+        return self.se(self.conv(x) + self.residual(x))
 
 
 class UNet2D(nn.Module):
@@ -97,7 +115,8 @@ class UNet2D(nn.Module):
         side_out1 = F.interpolate(self.side_out1(d1), size=x.size()[2:], mode='bilinear', align_corners=True)
 
         # Combine side outputs
-        out = self.final(torch.cat([side_out7, side_out6, side_out5, side_out4, side_out3, side_out2, side_out1], dim=1))
+        out = self.final(
+            torch.cat([side_out7, side_out6, side_out5, side_out4, side_out3, side_out2, side_out1], dim=1))
 
         if self.training and target is not None:
             # Simplify loss calculation
