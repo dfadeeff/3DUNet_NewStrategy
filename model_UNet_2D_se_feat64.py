@@ -26,22 +26,23 @@ class SEBlock(nn.Module):
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dropout_rate=0.1):
         super(ConvBlock, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(inplace=True),
-            nn.Dropout2d(dropout_rate),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(inplace=True),
-            nn.Dropout2d(dropout_rate)
-        )
-        self.residual = nn.Conv2d(in_channels, out_channels,
-                                  kernel_size=1) if in_channels != out_channels else nn.Identity()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.LeakyReLU(inplace=True)
+        self.dropout = nn.Dropout2d(dropout_rate)
+        self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
         self.se = SEBlock(out_channels)
 
     def forward(self, x):
-        return self.se(self.conv(x) + self.residual(x))
+        residual = self.residual(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.dropout(out)
+        out = out + residual
+        return self.se(out)
 
 
 class UNet2D(nn.Module):
@@ -138,7 +139,7 @@ class UNet2D(nn.Module):
                 target_clamped = target.clamp(0 + epsilon, 1 - epsilon)
                 mse_loss = F.mse_loss(side_output, target_clamped)
                 ssim_loss = 1 - ssim(side_output, target_clamped, data_range=1.0, size_average=True)
-                total_loss = mse_loss + 0.1 * ssim_loss
+                total_loss = 0.5 * mse_loss + 0.5 * ssim_loss # provide more weight to the SSIM loss
                 losses.append(total_loss * weight)
 
             # Apply content and style losses only on the final output
@@ -202,7 +203,7 @@ def calculate_psnr(img1, img2, data_range=1.0, eps=1e-8):
 
 
 class CombinedLoss(nn.Module):
-    def __init__(self, alpha=0.84, vgg_weight=0.1, epsilon=1e-6):
+    def __init__(self, alpha=0.3, vgg_weight=0.2, epsilon=1e-6):
         super(CombinedLoss, self).__init__()
         self.alpha = alpha
         self.mse = nn.MSELoss()
@@ -220,7 +221,8 @@ class CombinedLoss(nn.Module):
         content_loss, style_loss = self.vgg_loss(pred, target)
         vgg_loss = content_loss + style_loss
 
-        total_loss = self.alpha * mse_loss + (1 - self.alpha) * ssim_loss + self.vgg_weight * vgg_loss
+        # play with coefficients
+        total_loss = self.alpha * mse_loss + (1 - self.alpha - 0.2) * ssim_loss + self.vgg_weight * vgg_loss
 
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             print(f"NaN or Inf detected in loss: MSE={mse_loss.item()}, SSIM={ssim_loss.item()}, VGG={vgg_loss.item()}")

@@ -11,19 +11,33 @@ from model_UNet_2D_se_feat256 import UNet2D, calculate_psnr, CombinedLoss
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import OneCycleLR
+from torchvision import transforms
+from torchvision.transforms import RandomHorizontalFlip, RandomVerticalFlip, RandomRotation, RandomAffine
 
+
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 class BrainMRI2DDataset(Dataset):
-    def __init__(self, root_dir, slice_range=(2, 150), corrupt_threshold=1e-6):
+    def __init__(self, root_dir, slice_range=(2, 150), corrupt_threshold=1e-6, is_train=True):
         self.root_dir = root_dir
         self.slice_range = slice_range
         self.corrupt_threshold = corrupt_threshold
         self.data_list = self.parse_dataset()
         self.valid_slices = self.identify_valid_slices()
         self.normalization_params = {}
+        self.is_train = is_train
+        if self.is_train:
+            self.augment = transforms.Compose([
+                RandomHorizontalFlip(),
+                RandomVerticalFlip(),
+                RandomRotation(15),
+                RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1))
+            ])
+        else:
+            self.augment = None
 
     def parse_dataset(self):
         data_list = []
@@ -79,15 +93,19 @@ class BrainMRI2DDataset(Dataset):
         data_idx, slice_idx = self.valid_slices[idx]
         data_entry = self.data_list[data_idx]
 
+
+
         # Load all modalities
         flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))[slice_idx]
         t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))[slice_idx]
         t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))[slice_idx]
         t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))[slice_idx]
 
-        # Stack input modalities
+
+
         input_slice = np.stack([flair, t1c, t2], axis=0)
         target_slice = t1[np.newaxis, ...]
+
 
         input_slice = torch.from_numpy(input_slice).float()
         target_slice = torch.from_numpy(target_slice).float()
@@ -95,6 +113,15 @@ class BrainMRI2DDataset(Dataset):
         # Normalize input and target
         input_slice, input_min, input_max = self.normalize_slice(input_slice)
         target_slice, target_min, target_max = self.normalize_slice(target_slice)
+
+        if self.is_train and self.augment:
+            # Apply the same augmentation to both input and target
+            seed = torch.randint(0, 2**32, (1,)).item()
+            torch.manual_seed(seed)
+            input_slice = self.augment(input_slice)
+            torch.manual_seed(seed)
+            target_slice = self.augment(target_slice)
+
 
         patient_id = f"patient_{data_idx}"
         if patient_id not in self.normalization_params:
@@ -180,15 +207,11 @@ def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_f256.pth"):
 
 def get_optimizer_and_scheduler(model, config, train_loader):
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-    scheduler = OneCycleLR(
+    scheduler = CosineAnnealingWarmRestarts(
         optimizer,
-        max_lr=config['learning_rate'],
-        epochs=config['num_epochs'],
-        steps_per_epoch=len(train_loader),
-        pct_start=0.3,
-        anneal_strategy='cos',
-        div_factor=25.0,
-        final_div_factor=10000.0
+        T_0=10,  # Number of iterations for the first restart
+        T_mult=2,  # A factor increases T_i after a restart
+        eta_min=1e-6  # Minimum learning rate
     )
     return optimizer, scheduler
 
@@ -330,14 +353,14 @@ def main():
         'weight_decay': 1e-5,
     }
 
-    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
     val_root_dir = '../data/brats18/val/'
 
-    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'])
-    val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'])
+    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'], is_train=True)
+    val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'], is_train=False)
 
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4,
                               pin_memory=True)
