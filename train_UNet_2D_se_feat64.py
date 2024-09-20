@@ -42,6 +42,7 @@ class BrainMRI2DDataset(Dataset):
                         data_entry['T1c'] = os.path.join(subject_path, filename)
                     elif filename.endswith('t2.nii'):
                         data_entry['T2'] = os.path.join(subject_path, filename)
+
                 if all(data_entry.values()):
                     data_list.append(data_entry)
                 else:
