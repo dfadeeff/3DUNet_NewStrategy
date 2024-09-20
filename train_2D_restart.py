@@ -9,7 +9,7 @@ from tqdm import tqdm
 import os
 import SimpleITK as sitk
 from sklearn.model_selection import train_test_split
-from model_UNet_2D_multi_scale_corr import UNet2D, calculate_psnr, CombinedLoss
+from model_2D_restart import UNet2D, calculate_psnr, CombinedLoss
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
