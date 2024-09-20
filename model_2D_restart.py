@@ -32,7 +32,8 @@ class ConvBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.relu = nn.LeakyReLU(inplace=True)
         self.dropout = nn.Dropout2d(dropout_rate)
-        self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+        self.residual = nn.Conv2d(in_channels, out_channels,
+                                  kernel_size=1) if in_channels != out_channels else nn.Identity()
         self.se = SEBlock(out_channels)
 
     def forward(self, x):
@@ -191,7 +192,14 @@ class CombinedLoss(nn.Module):
         self.vgg_weight = vgg_weight
         self.epsilon = epsilon
 
+    def to(self, device):
+        self.vgg_loss = self.vgg_loss.to(device)
+        return super().to(device)
+
     def forward(self, pred, target):
+        # Ensure pred and target are on the same device and have the same dtype
+        pred = pred.to(target.device, dtype=target.dtype)
+
         # Clamp predictions and targets to avoid numerical issues
         pred = pred.clamp(self.epsilon, 1 - self.epsilon)
         target = target.clamp(self.epsilon, 1 - self.epsilon)
@@ -248,6 +256,6 @@ def test_model():
 
 
 if __name__ == "__main__":
-    #test_model()
+    # test_model()
     model = UNet2D(in_channels=3, out_channels=1, init_features=128)
     print(sum(p.numel() for p in model.parameters() if p.requires_grad))

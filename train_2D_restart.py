@@ -163,15 +163,11 @@ class BrainMRI2DDataset(Dataset):
 
         # Stack slices and modalities
         # Input channels: num_modalities x num_slices
-        input_slice = np.concatenate([
-            flair_slices,
-            t1c_slices,
-            t2_slices
-        ], axis=0)
+        input_slice = np.concatenate([flair_slices, t1c_slices, t2_slices], axis=0)  # Shape: (9, H, W)
         target_slice = t1_slices[len(slices_indices) // 2][np.newaxis, ...]  # Use the center slice as target
 
-        input_slice = torch.from_numpy(input_slice).float()
-        target_slice = torch.from_numpy(target_slice).float()
+        input_slice = torch.from_numpy(input_slice).float()  # Shape: (9, H, W)
+        target_slice = torch.from_numpy(target_slice).float()  # Shape: (1, H, W)
 
         if self.full_image:
             # Do not extract patches; return the whole image
@@ -259,32 +255,25 @@ class BrainMRI2DDataset(Dataset):
         return input_patch, target_patch
 
     def get_full_slice(self, idx):
-        """
-        Retrieves the full image slices without patch extraction.
-
-        Args:
-            idx (int): Index of the slice.
-
-        Returns:
-            tuple: (input_slice, target_slice)
-        """
         data_idx, slice_idx = self.slices_info[idx]
         data_entry = self.data_list[data_idx]
 
         # Load all modalities
-        flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))[slice_idx]
-        t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))[slice_idx]
-        t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))[slice_idx]
-        t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))[slice_idx]
+        flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))
+        t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))
+        t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))
+        t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))
 
-        # Stack input modalities
-        input_slice = np.stack([flair, t1c, t2], axis=0)
-        target_slice = t1[np.newaxis, ...]
+        # Collect adjacent slices
+        slices_indices = self.get_adjacent_slices(slice_idx, flair.shape[0])
 
-        input_slice = torch.from_numpy(input_slice).float()
-        target_slice = torch.from_numpy(target_slice).float()
+        # Stack adjacent slices per modality
+        flair_slices = flair[slices_indices]
+        t1_slices = t1[slices_indices]
+        t1c_slices = t1c[slices_indices]
+        t2_slices = t2[slices_indices]
 
-        # Apply Z-score normalization using precomputed mean and std
+        # Normalize using precomputed mean and std
         patient_id = f"patient_{data_idx}"
         epsilon = 1e-8  # To prevent division by zero
 
@@ -293,10 +282,17 @@ class BrainMRI2DDataset(Dataset):
         t1c_params = self.normalization_params[patient_id]['T1c']
         t2_params = self.normalization_params[patient_id]['T2']
 
-        input_slice[0] = (input_slice[0] - flair_params['mean']) / (flair_params['std'] + epsilon)
-        input_slice[1] = (input_slice[1] - t1c_params['mean']) / (t1c_params['std'] + epsilon)
-        input_slice[2] = (input_slice[2] - t2_params['mean']) / (t2_params['std'] + epsilon)
-        target_slice = (target_slice - t1_params['mean']) / (t1_params['std'] + epsilon)
+        flair_slices = (flair_slices - flair_params['mean']) / (flair_params['std'] + epsilon)
+        t1_slices = (t1_slices - t1_params['mean']) / (t1_params['std'] + epsilon)
+        t1c_slices = (t1c_slices - t1c_params['mean']) / (t1c_params['std'] + epsilon)
+        t2_slices = (t2_slices - t2_params['mean']) / (t2_params['std'] + epsilon)
+
+        # Stack slices and modalities
+        input_slice = np.concatenate([flair_slices, t1c_slices, t2_slices], axis=0)
+        target_slice = t1_slices[len(slices_indices) // 2][np.newaxis, ...]  # Use the center slice as target
+
+        input_slice = torch.from_numpy(input_slice).float()
+        target_slice = torch.from_numpy(target_slice).float()
 
         return input_slice, target_slice
 
@@ -365,17 +361,6 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer, num_patc
 
 
 def visualize_full_image(inputs, targets, outputs, epoch, batch_idx, writer):
-    """
-    Visualizes a full image.
-
-    Args:
-        inputs (torch.Tensor): Input full image.
-        targets (torch.Tensor): Target full image.
-        outputs (torch.Tensor): Output full image.
-        epoch (int): Current epoch number.
-        batch_idx (int): Current batch index.
-        writer (SummaryWriter): TensorBoard writer.
-    """
     input_slices = inputs[0].cpu().numpy()
     target_slice = targets[0, 0].cpu().numpy()
     output_slice = outputs[0, 0].detach().cpu().numpy().clip(0, 1)
@@ -486,7 +471,7 @@ def train_epoch(model, train_loader, optimizer, device, epoch, writer, scaler=No
         optimizer.zero_grad()
 
         if scaler is not None:
-            with autocast():
+            with autocast(device_type='cuda'):
                 outputs, loss, _ = model(inputs, targets)  # Pass targets and receive loss
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -521,52 +506,36 @@ def train_epoch(model, train_loader, optimizer, device, epoch, writer, scaler=No
 
 
 def validate(model, val_loader, device, epoch, writer, dataset, visualize_full=False):
-    """
-    Validates the model on the validation dataset.
-
-    Args:
-        model (torch.nn.Module): The model to validate.
-        val_loader (DataLoader): DataLoader for validation data.
-        device (torch.device): Device to validate on.
-        epoch (int): Current epoch number.
-        writer (SummaryWriter): TensorBoard writer.
-        dataset (BrainMRI2DDataset): The dataset being used.
-        visualize_full (bool): Whether to visualize full images.
-
-    Returns:
-        tuple: (val_loss, val_psnr, val_ssim)
-    """
     model.eval()
     val_loss = 0.0
     val_psnr = 0.0
     val_ssim = 0.0
+    combined_loss = CombinedLoss().to(device)
 
     with torch.no_grad():
         for batch_idx, (inputs, targets, indices) in enumerate(tqdm(val_loader, desc="Validation")):
             inputs, targets = inputs.to(device), targets.to(device)
 
             if visualize_full and batch_idx == 0:
-                # Visualize a full image
                 full_input, full_target = dataset.get_full_slice(indices[0])
                 full_input = full_input.unsqueeze(0).to(device)
-                with autocast():
-                    full_output, loss, _ = model(full_input, full_target)
-                visualize_full_image(full_input, full_target.unsqueeze(0), full_output, epoch, batch_idx, writer)
+                full_target = full_target.unsqueeze(0).to(device)
+                with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                    full_output = model(full_input)
+                visualize_full_image(full_input, full_target, full_output, epoch, batch_idx, writer)
 
-            with autocast():
-                outputs = model(inputs, targets)  # During evaluation, pass targets if loss is computed inside
+            with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                outputs = model(inputs)
 
-            # Assuming the model returns outputs and loss
-            if isinstance(outputs, tuple):
-                outputs, loss, _ = outputs
-            else:
-                # If model only returns outputs
-                loss = CombinedLoss()(outputs, targets)
+            # Ensure outputs and targets are on the same device and have the same dtype
+            outputs = outputs.to(device=targets.device, dtype=targets.dtype)
 
-            outputs_float = outputs.detach().float().clamp(0, 1)
-            targets_float = targets.float().clamp(0, 1)
+            loss = combined_loss(outputs, targets)
 
             val_loss += loss.item()
+
+            outputs_float = outputs.float().clamp(0, 1)
+            targets_float = targets.float().clamp(0, 1)
 
             psnr = calculate_psnr(outputs_float, targets_float)
             ssim_value = ssim(outputs_float, targets_float, data_range=1.0, size_average=True)
@@ -584,6 +553,7 @@ def validate(model, val_loader, device, epoch, writer, dataset, visualize_full=F
     avg_ssim = val_ssim / len(val_loader)
 
     return avg_loss, avg_psnr, avg_ssim
+
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer, dataset,
                 scaler=None):
@@ -725,7 +695,7 @@ def main():
     model = UNet2D(in_channels=in_channels, out_channels=1, init_features=32).to(device)
 
     # Initialize the loss function
-    criterion = CombinedLoss(alpha=0.5, vgg_weight=0.2)
+    criterion = CombinedLoss(alpha=0.5, vgg_weight=0.2).to(device)
 
     # Initialize the optimizer
     optimizer = optim.AdamW(
