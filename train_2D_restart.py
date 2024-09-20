@@ -673,7 +673,7 @@ def main():
         'num_adjacent_slices': 3,
         'augment': True,
         'patch_size': 128,
-        'center_bias': 0.8,
+        'center_bias': 0.85,
         'corrupt_threshold': 1e-6,
         'root_dir': '../data/brats18/train/combined/',
         'val_root_dir': '../data/brats18/val/',
