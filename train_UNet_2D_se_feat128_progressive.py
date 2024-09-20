@@ -8,14 +8,18 @@ from tqdm import tqdm
 import os
 import torch.nn.functional as F
 import SimpleITK as sitk
-from model_UNet_2D_se_feat64 import UNet2D, calculate_psnr, CombinedLoss
+from model_UNet_2D_se_feat128_progressive import UNet2D, calculate_psnr
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
-from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import OneCycleLR
 
+# Import GradScaler and autocast only if CUDA is available
+if torch.cuda.is_available():
+    from torch.cuda.amp import GradScaler, autocast
+else:
+    GradScaler = None
+    autocast = None
 
 class BrainMRI2DDataset(Dataset):
     def __init__(self, root_dir, slice_range=(2, 150), corrupt_threshold=1e-6):
@@ -65,14 +69,6 @@ class BrainMRI2DDataset(Dataset):
                     valid_slices.append((idx, slice_idx))
         return valid_slices
 
-    def create_slices_info(self):
-        slices_info = []
-        for idx, data_entry in enumerate(self.data_list):
-            image = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))
-            for slice_idx in range(self.slice_range[0], min(self.slice_range[1], image.shape[0])):
-                slices_info.append((idx, slice_idx))
-        return slices_info
-
     def __len__(self):
         return len(self.valid_slices)
 
@@ -113,10 +109,6 @@ class BrainMRI2DDataset(Dataset):
         normalized_tensor = (tensor - min_val) / (max_val - min_val + epsilon)
         return normalized_tensor, min_val.item(), max_val.item()
 
-    def get_full_slice(self, idx):
-        return self.__getitem__(idx)
-
-
 def compute_loss(outputs, side_outputs, targets, model):
     # Loss calculation
     losses = []
@@ -139,11 +131,11 @@ def compute_loss(outputs, side_outputs, targets, model):
     total_loss = sum(losses)
     return total_loss
 
-
 def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
-    input_slices = inputs[0].cpu().numpy()
-    target_slice = targets[0, 0].cpu().numpy()
-    output_slice = outputs[0, 0].detach().cpu().numpy().clip(0, 1)
+    # Ensure tensors are in float32 before converting to NumPy arrays
+    input_slices = inputs[0].cpu().float().numpy()
+    target_slice = targets[0, 0].cpu().float().numpy()
+    output_slice = outputs[0, 0].detach().cpu().float().numpy().clip(0, 1)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
@@ -176,8 +168,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     writer.add_figure(f'Visualization/Epoch_{epoch}_Batch_{batch_idx}', fig, epoch)
     plt.close(fig)
 
-
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_f64.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_prog.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -186,8 +177,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_f6
     }, filename)
     print(f"Checkpoint saved: {filename}")
 
-
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_f64.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_prog.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -200,7 +190,6 @@ def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_f64.pth"):
     else:
         print(f"No checkpoint found at '{filename}'")
         return 0
-
 
 def get_optimizer_and_scheduler(model, config, train_loader):
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
@@ -216,8 +205,7 @@ def get_optimizer_and_scheduler(model, config, train_loader):
     )
     return optimizer, scheduler
 
-
-def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, epoch, writer):
+def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, epoch, writer):
     model.train()
     running_loss = 0.0
     running_psnr = 0.0
@@ -225,22 +213,28 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, de
 
     for batch_idx, (inputs, targets, indices) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
         inputs, targets = inputs.to(device), targets.to(device)
-
         optimizer.zero_grad()
-        with autocast(device_type='cuda'):
-            outputs, loss, _ = model(inputs, targets)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        if scaler is not None:
+            # Use autocast and GradScaler when CUDA is available
+            with autocast():
+                outputs, side_outputs = model(inputs)
+                loss = compute_loss(outputs, side_outputs, targets, model)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Standard training when CUDA is not available
+            outputs, side_outputs = model(inputs)
+            loss = compute_loss(outputs, side_outputs, targets, model)
+            loss.backward()
+            optimizer.step()
 
         scheduler.step()
 
         running_loss += loss.item()
 
-        outputs_float = outputs.float()
+        outputs_float = outputs.detach().float()
         targets_float = targets.float()
 
         psnr = calculate_psnr(outputs_float, targets_float)
@@ -252,7 +246,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, de
             running_ssim += ssim_value.item()
 
         if batch_idx % 10 == 0:
-            visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer)
+            visualize_batch(inputs, targets, outputs_float, epoch, batch_idx, writer)
 
     epoch_loss = running_loss / len(train_loader)
     epoch_psnr = running_psnr / len(train_loader)
@@ -260,8 +254,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, de
 
     return epoch_loss, epoch_psnr, epoch_ssim
 
-
-def validate(model, val_loader, criterion, device, epoch, writer):
+def validate(model, val_loader, device, epoch, writer):
     model.eval()
     val_loss = 0.0
     val_psnr = 0.0
@@ -270,12 +263,17 @@ def validate(model, val_loader, criterion, device, epoch, writer):
     with torch.no_grad():
         for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
 
-            outputs_float = outputs.float().clamp(0, 1)
+            if torch.cuda.is_available() and autocast is not None:
+                with autocast():
+                    outputs, side_outputs = model(inputs)
+            else:
+                outputs, side_outputs = model(inputs)
+
+            outputs_float = outputs.detach().float().clamp(0, 1)
             targets_float = targets.float()
 
-            loss = criterion(outputs_float, targets_float)
+            loss = compute_loss(outputs_float, side_outputs, targets_float, model)
 
             if not torch.isnan(loss) and not torch.isinf(loss):
                 val_loss += loss.item()
@@ -289,7 +287,7 @@ def validate(model, val_loader, criterion, device, epoch, writer):
                 val_ssim += ssim_value.item()
 
             if batch_idx == 0:
-                visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer)
+                visualize_batch(inputs, targets, outputs_float, epoch, batch_idx, writer)
 
                 writer.add_histogram('Validation/InputHistogram', inputs, epoch)
                 writer.add_histogram('Validation/OutputHistogram', outputs, epoch)
@@ -297,18 +295,22 @@ def validate(model, val_loader, criterion, device, epoch, writer):
 
     return (val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader))
 
+def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, device, writer):
+    if torch.cuda.is_available():
+        scaler = GradScaler()
+    else:
+        scaler = None
 
-def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, writer):
-    scaler = GradScaler()
     best_val_loss = float('inf')
     patience = 30
     patience_counter = 0
 
     for epoch in range(num_epochs):
-        train_loss, train_psnr, train_ssim = train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler,
-                                                         device, epoch, writer)
+        train_loss, train_psnr, train_ssim = train_epoch(
+            model, train_loader, optimizer, scheduler, scaler, device, epoch, writer
+        )
 
-        val_loss, val_psnr, val_ssim = validate(model, val_loader, criterion, device, epoch, writer)
+        val_loss, val_psnr, val_ssim = validate(model, val_loader, device, epoch, writer)
 
         print(f"Epoch [{epoch + 1}/{num_epochs}]")
         print(f"Train - Loss: {train_loss:.4f}, PSNR: {train_psnr:.2f}, SSIM: {train_ssim:.4f}")
@@ -339,7 +341,6 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, num_
 
     print("Training completed successfully!")
 
-
 def main():
     torch.manual_seed(42)
     np.random.seed(42)
@@ -352,7 +353,7 @@ def main():
         'weight_decay': 1e-5,
     }
 
-    device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -367,23 +368,23 @@ def main():
 
     model = UNet2D(in_channels=3, out_channels=1, init_features=32).to(device)
 
-    criterion = CombinedLoss().to(device)
     optimizer, scheduler = get_optimizer_and_scheduler(model, config, train_loader)
 
-    writer = SummaryWriter('runs/2d_unet_se_f64')
+    writer = SummaryWriter('runs/2d_unet_se_prog')
 
     start_epoch = load_checkpoint(model, optimizer)
 
-    train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
-          writer)
+    train(
+        model, train_loader, val_loader, optimizer, scheduler,
+        config['num_epochs'] - start_epoch, device, writer
+    )
 
-    torch.save(model.state_dict(), '2d_unet_model_se_f64.pth')
+    torch.save(model.state_dict(), '2d_unet_model_se_prog.pth')
 
-    with open('patient_normalization_params_2d_se_f64.json', 'w') as f:
+    with open('patient_normalization_params_2d_se_prog.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
-
 
 if __name__ == '__main__':
     main()

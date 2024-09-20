@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_UNet_2D_se_feat64 import UNet2D, calculate_psnr, CombinedLoss
+from model_UNet_2D_se_feat128 import UNet2D, calculate_psnr, CombinedLoss
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
@@ -153,7 +153,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_f64.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_f128.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -163,7 +163,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_f6
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_f64.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_f128.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -321,14 +321,14 @@ def main():
     np.random.seed(42)
 
     config = {
-        'batch_size': 16,
+        'batch_size': 4,
         'num_epochs': 50,
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
         'weight_decay': 1e-5,
     }
 
-    device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -341,21 +341,21 @@ def main():
                               pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
-    model = UNet2D(in_channels=3, out_channels=1, init_features=32).to(device)
+    model = UNet2D(in_channels=3, out_channels=1, init_features=128).to(device)
 
     criterion = CombinedLoss().to(device)
     optimizer, scheduler = get_optimizer_and_scheduler(model, config, train_loader)
 
-    writer = SummaryWriter('runs/2d_unet_se_f64')
+    writer = SummaryWriter('runs/2d_unet_se_f128')
 
     start_epoch = load_checkpoint(model, optimizer)
 
     train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
           writer)
 
-    torch.save(model.state_dict(), '2d_unet_model_se_f64.pth')
+    torch.save(model.state_dict(), '2d_unet_model_se_f128.pth')
 
-    with open('patient_normalization_params_2d_se_f64.json', 'w') as f:
+    with open('patient_normalization_params_2d_se_f128.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
