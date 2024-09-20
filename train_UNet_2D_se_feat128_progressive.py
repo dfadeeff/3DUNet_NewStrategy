@@ -14,13 +14,7 @@ import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-
-# Import GradScaler and autocast only if CUDA is available
-if torch.cuda.is_available():
-    from torch.cuda.amp import GradScaler, autocast
-else:
-    GradScaler = None
-    autocast = None
+from torch.amp import GradScaler, autocast
 
 
 class BrainMRI2DDataset(Dataset):
@@ -244,18 +238,14 @@ def train_epoch(model, train_loader, optimizer, device, epoch, writer, scaler=No
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
 
-        if scaler is not None:
-            with autocast():
-                outputs = model(inputs)
-                loss = compute_loss(outputs, targets)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+        with autocast(device_type='cuda'):
             outputs = model(inputs)
             loss = compute_loss(outputs, targets)
-            loss.backward()
-            optimizer.step()
+
+        # Backward pass with scaling
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         running_loss += loss.item()
 
@@ -290,10 +280,7 @@ def validate(model, val_loader, device, epoch, writer):
         for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
             inputs, targets = inputs.to(device), targets.to(device)
 
-            if torch.cuda.is_available() and autocast is not None:
-                with autocast():
-                    outputs = model(inputs)
-            else:
+            with autocast(device_type='cuda'):
                 outputs = model(inputs)
 
             outputs_float = outputs.detach().float().clamp(0, 1)
@@ -384,7 +371,7 @@ def main():
         'augment': True,
     }
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
