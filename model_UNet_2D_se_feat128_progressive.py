@@ -47,20 +47,16 @@ class ConvBlock(nn.Module):
 
 
 class UNet2D(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, init_features=32, max_features=1024, dropout_rate=0.1,
-                 num_layers=7):
+    def __init__(self, in_channels=3, out_channels=1, init_features=32, max_features=512, dropout_rate=0.1,
+                 num_layers=4):
         super(UNet2D, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.vgg_loss = VGGLoss()
-        self.scale_weights = nn.Parameter(torch.ones(num_layers))
-        self.softmax = nn.Softmax(dim=0)
         self.num_layers = num_layers
 
         features = init_features
         self.encoder_blocks = nn.ModuleList()
         self.decoder_blocks = nn.ModuleList()
-        self.side_outputs = nn.ModuleList()
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         # Track the number of channels at each encoder block
@@ -71,7 +67,8 @@ class UNet2D(nn.Module):
         for i in range(num_layers):
             out_channels = min(features, max_features)
             self.encoder_blocks.append(ConvBlock(in_channels, out_channels, dropout_rate))
-            self.side_outputs.append(nn.Conv2d(out_channels, self.out_channels, kernel_size=1))
+            # Remove side outputs
+            # self.side_outputs.append(nn.Conv2d(out_channels, self.out_channels, kernel_size=1))
             self.encoder_channels.append(out_channels)
             in_channels = out_channels
             features *= 2
@@ -121,53 +118,12 @@ class UNet2D(nn.Module):
             x = block(x)
 
         # Side outputs and final output
-        side_outputs = [
-            F.interpolate(self.side_outputs[i](encoder_outputs[i]), size=encoder_outputs[0].size()[2:], mode='bilinear',
-                          align_corners=True) for i in range(self.num_layers)]
+        # side_outputs = [
+        #     F.interpolate(self.side_outputs[i](encoder_outputs[i]), size=encoder_outputs[0].size()[2:], mode='bilinear',
+        #                   align_corners=True) for i in range(self.num_layers)]
         out = self.final(x)
 
-        return out, side_outputs
-
-
-class VGGLoss(nn.Module):
-    def __init__(self):
-        super(VGGLoss, self).__init__()
-        vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features
-        self.slice1 = nn.Sequential(*list(vgg.children())[:4])
-        self.slice2 = nn.Sequential(*list(vgg.children())[4:9])
-        for param in self.parameters():
-            param.requires_grad = False
-
-    def forward(self, input, target):
-        if input.size(1) == 1:
-            input = input.repeat(1, 3, 1, 1)
-        if target.size(1) == 1:
-            target = target.repeat(1, 3, 1, 1)
-
-        input_feat1 = self.slice1(input)
-        input_feat2 = self.slice2(input_feat1)
-        target_feat1 = self.slice1(target)
-        target_feat2 = self.slice2(target_feat1)
-
-        content_loss = F.mse_loss(input_feat1, target_feat1)
-        style_loss = self.compute_gram_loss([input_feat1, input_feat2], [target_feat1, target_feat2])
-
-        return content_loss, style_loss
-
-    def compute_gram_loss(self, input_features, target_features):
-        loss = 0
-        for input_feat, target_feat in zip(input_features, target_features):
-            input_gram = self.gram_matrix(input_feat)
-            target_gram = self.gram_matrix(target_feat)
-            loss += F.mse_loss(input_gram, target_gram)
-        return loss
-
-    @staticmethod
-    def gram_matrix(x):
-        b, c, h, w = x.size()
-        features = x.view(b, c, h * w)
-        gram = torch.bmm(features, features.transpose(1, 2))
-        return gram.div(c * h * w)
+        return out
 
 
 def calculate_psnr(img1, img2, data_range=1.0, eps=1e-8):
@@ -196,7 +152,7 @@ def test_model():
 
         # Forward pass through the model
         with torch.no_grad():
-            output_slice, side_outputs = model(slice_input)  # Get outputs and side outputs
+            output_slice = model(slice_input)  # Get outputs and side outputs
 
         # Store the output slice
         output_volume[:, :, i, :, :] = output_slice

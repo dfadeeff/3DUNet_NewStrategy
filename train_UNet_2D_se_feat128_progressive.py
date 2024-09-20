@@ -1,4 +1,5 @@
 import torch
+import random
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -12,7 +13,7 @@ from model_UNet_2D_se_feat128_progressive import UNet2D, calculate_psnr
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Import GradScaler and autocast only if CUDA is available
 if torch.cuda.is_available():
@@ -21,14 +22,18 @@ else:
     GradScaler = None
     autocast = None
 
+
 class BrainMRI2DDataset(Dataset):
-    def __init__(self, root_dir, slice_range=(2, 150), corrupt_threshold=1e-6):
+    def __init__(self, root_dir, slice_range=(2, 150), num_adjacent_slices=3, corrupt_threshold=1e-6, augment=False):
         self.root_dir = root_dir
         self.slice_range = slice_range
         self.corrupt_threshold = corrupt_threshold
+        self.num_adjacent_slices = num_adjacent_slices
+        self.augment = augment
         self.data_list = self.parse_dataset()
         self.valid_slices = self.identify_valid_slices()
         self.normalization_params = {}
+        self.compute_normalization_params()
 
     def parse_dataset(self):
         data_list = []
@@ -39,13 +44,13 @@ class BrainMRI2DDataset(Dataset):
                 for filename in os.listdir(subject_path):
                     if filename.startswith('.') or filename.startswith('._'):
                         continue
-                    if filename.endswith('flair.nii'):
+                    if filename.endswith('flair.nii') or filename.endswith('flair.nii.gz'):
                         data_entry['FLAIR'] = os.path.join(subject_path, filename)
-                    elif filename.endswith('t1.nii'):
+                    elif filename.endswith('t1.nii') or filename.endswith('t1.nii.gz'):
                         data_entry['T1'] = os.path.join(subject_path, filename)
-                    elif filename.endswith('t1ce.nii'):
+                    elif filename.endswith('t1ce.nii') or filename.endswith('t1ce.nii.gz'):
                         data_entry['T1c'] = os.path.join(subject_path, filename)
-                    elif filename.endswith('t2.nii'):
+                    elif filename.endswith('t2.nii') or filename.endswith('t2.nii.gz'):
                         data_entry['T2'] = os.path.join(subject_path, filename)
                 if all(data_entry.values()):
                     data_list.append(data_entry)
@@ -57,17 +62,26 @@ class BrainMRI2DDataset(Dataset):
         valid_slices = []
         for idx, data_entry in enumerate(tqdm(self.data_list, desc="Identifying valid slices")):
             flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))
-            t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))
-            t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))
-            t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))
-
             for slice_idx in range(self.slice_range[0], min(self.slice_range[1], flair.shape[0])):
-                if (flair[slice_idx].max() > self.corrupt_threshold and
-                        t1[slice_idx].max() > self.corrupt_threshold and
-                        t1c[slice_idx].max() > self.corrupt_threshold and
-                        t2[slice_idx].max() > self.corrupt_threshold):
-                    valid_slices.append((idx, slice_idx))
+                valid_slices.append((idx, slice_idx))
         return valid_slices
+
+    def compute_normalization_params(self):
+        for idx, data_entry in enumerate(tqdm(self.data_list, desc="Computing normalization parameters")):
+            patient_id = f"patient_{idx}"
+            self.normalization_params[patient_id] = {}
+            modalities = ['FLAIR', 'T1', 'T1c', 'T2']
+            for modality in modalities:
+                image = sitk.GetArrayFromImage(sitk.ReadImage(data_entry[modality]))
+                valid_slices = image[self.slice_range[0]:self.slice_range[1]]
+                valid_pixels = valid_slices[valid_slices > self.corrupt_threshold]
+                if len(valid_pixels) > 0:
+                    mean = valid_pixels.mean()
+                    std = valid_pixels.std()
+                else:
+                    mean = 0
+                    std = 1
+                self.normalization_params[patient_id][modality] = {'mean': mean, 'std': std}
 
     def __len__(self):
         return len(self.valid_slices)
@@ -76,60 +90,86 @@ class BrainMRI2DDataset(Dataset):
         data_idx, slice_idx = self.valid_slices[idx]
         data_entry = self.data_list[data_idx]
 
-        # Load all modalities
-        flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))[slice_idx]
-        t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))[slice_idx]
-        t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))[slice_idx]
-        t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))[slice_idx]
+        # Load images
+        flair_img = sitk.ReadImage(data_entry['FLAIR'])
+        t1_img = sitk.ReadImage(data_entry['T1'])
+        t1c_img = sitk.ReadImage(data_entry['T1c'])
+        t2_img = sitk.ReadImage(data_entry['T2'])
 
-        # Stack input modalities
-        input_slice = np.stack([flair, t1c, t2], axis=0)
-        target_slice = t1[np.newaxis, ...]
+        # Convert to arrays
+        flair = sitk.GetArrayFromImage(flair_img)
+        t1 = sitk.GetArrayFromImage(t1_img)
+        t1c = sitk.GetArrayFromImage(t1c_img)
+        t2 = sitk.GetArrayFromImage(t2_img)
+
+        # Collect adjacent slices
+        num_slices = self.num_adjacent_slices
+        half_slices = num_slices // 2
+        slices_indices = range(slice_idx - half_slices, slice_idx + half_slices + 1)
+        slices_indices = [max(0, min(idx, flair.shape[0] - 1)) for idx in slices_indices]
+
+        # For each modality, stack adjacent slices
+        flair_slices = flair[slices_indices]
+        t1_slices = t1[slices_indices]
+        t1c_slices = t1c[slices_indices]
+        t2_slices = t2[slices_indices]
+
+        # Normalize using precomputed mean and std
+        patient_id = f"patient_{data_idx}"
+        epsilon = 1e-8  # To prevent division by zero
+
+        flair_params = self.normalization_params[patient_id]['FLAIR']
+        t1_params = self.normalization_params[patient_id]['T1']
+        t1c_params = self.normalization_params[patient_id]['T1c']
+        t2_params = self.normalization_params[patient_id]['T2']
+
+        flair_slices = (flair_slices - flair_params['mean']) / (flair_params['std'] + epsilon)
+        t1_slices = (t1_slices - t1_params['mean']) / (t1_params['std'] + epsilon)
+        t1c_slices = (t1c_slices - t1c_params['mean']) / (t1c_params['std'] + epsilon)
+        t2_slices = (t2_slices - t2_params['mean']) / (t2_params['std'] + epsilon)
+
+        # Stack slices and modalities
+        # Input channels: num_modalities x num_slices
+        input_slice = np.concatenate([
+            flair_slices,
+            t1c_slices,
+            t2_slices
+        ], axis=0)
+        target_slice = t1_slices[half_slices][np.newaxis, ...]  # Use the center slice as target
 
         input_slice = torch.from_numpy(input_slice).float()
         target_slice = torch.from_numpy(target_slice).float()
 
-        # Normalize input and target
-        input_slice, input_min, input_max = self.normalize_slice(input_slice)
-        target_slice, target_min, target_max = self.normalize_slice(target_slice)
-
-        patient_id = f"patient_{data_idx}"
-        if patient_id not in self.normalization_params:
-            self.normalization_params[patient_id] = {}
-        self.normalization_params[patient_id]['input'] = {'min': input_min, 'max': input_max}
-        self.normalization_params[patient_id]['target'] = {'min': target_min, 'max': target_max}
+        # Apply data augmentation
+        if self.augment:
+            input_slice, target_slice = self.random_transform(input_slice, target_slice)
 
         return input_slice, target_slice, idx
 
-    def normalize_slice(self, tensor, epsilon=1e-7):
-        min_val = torch.min(tensor)
-        max_val = torch.max(tensor)
-        if max_val - min_val < epsilon:
-            return tensor, min_val.item(), max_val.item()
-        normalized_tensor = (tensor - min_val) / (max_val - min_val + epsilon)
-        return normalized_tensor, min_val.item(), max_val.item()
+    def random_transform(self, input_slice, target_slice):
+        # Concatenate input and target along the channel dimension
+        combined = torch.cat([input_slice, target_slice], dim=0)
+        # Random horizontal flip
+        if random.random() > 0.5:
+            combined = torch.flip(combined, dims=[2])
+        # Random vertical flip
+        if random.random() > 0.5:
+            combined = torch.flip(combined, dims=[1])
+        # Random rotation (0, 90, 180, 270 degrees)
+        k = random.randint(0, 3)
+        combined = torch.rot90(combined, k, dims=[1, 2])
+        # Split back input and target
+        input_slice = combined[:-1, :, :]
+        target_slice = combined[-1:, :, :]
+        return input_slice, target_slice
 
-def compute_loss(outputs, side_outputs, targets, model):
-    # Loss calculation
-    losses = []
-    weights = model.softmax(model.scale_weights)
-    epsilon = 1e-8
 
-    for i, (side_output, weight) in enumerate(zip(side_outputs + [outputs], weights)):
-        side_output = side_output.clamp(0 + epsilon, 1 - epsilon)
-        target_clamped = targets.clamp(0 + epsilon, 1 - epsilon)
-        mse_loss = F.mse_loss(side_output, target_clamped)
-        ssim_loss = 1 - ssim(side_output, target_clamped, data_range=1.0, size_average=True)
-        total_loss = 0.5 * mse_loss + 0.5 * ssim_loss
-        losses.append(total_loss * weight)
-
-    # Apply content and style losses only on the final output
-    content_loss, style_loss = model.vgg_loss(outputs, target_clamped)
-    final_loss = losses[-1] + 0.1 * (content_loss + style_loss)
-    losses[-1] = final_loss
-
-    total_loss = sum(losses)
+def compute_loss(outputs, targets):
+    mse_loss = F.mse_loss(outputs, targets)
+    ssim_loss_value = 1 - ssim(outputs, targets, data_range=1.0, size_average=True)
+    total_loss = 0.5 * mse_loss + 0.5 * ssim_loss_value
     return total_loss
+
 
 def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     # Ensure tensors are in float32 before converting to NumPy arrays
@@ -168,6 +208,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     writer.add_figure(f'Visualization/Epoch_{epoch}_Batch_{batch_idx}', fig, epoch)
     plt.close(fig)
 
+
 def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_prog.pth"):
     torch.save({
         'epoch': epoch,
@@ -176,6 +217,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_pr
         'loss': loss,
     }, filename)
     print(f"Checkpoint saved: {filename}")
+
 
 def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_prog.pth"):
     if os.path.isfile(filename):
@@ -191,21 +233,8 @@ def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_prog.pth"):
         print(f"No checkpoint found at '{filename}'")
         return 0
 
-def get_optimizer_and_scheduler(model, config, train_loader):
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=config['learning_rate'],
-        epochs=config['num_epochs'],
-        steps_per_epoch=len(train_loader),
-        pct_start=0.3,
-        anneal_strategy='cos',
-        div_factor=25.0,
-        final_div_factor=10000.0
-    )
-    return optimizer, scheduler
 
-def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, epoch, writer):
+def train_epoch(model, train_loader, optimizer, device, epoch, writer, scaler=None):
     model.train()
     running_loss = 0.0
     running_psnr = 0.0
@@ -216,36 +245,32 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, epoch
         optimizer.zero_grad()
 
         if scaler is not None:
-            # Use autocast and GradScaler when CUDA is available
             with autocast():
-                outputs, side_outputs = model(inputs)
-                loss = compute_loss(outputs, side_outputs, targets, model)
+                outputs = model(inputs)
+                loss = compute_loss(outputs, targets)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            # Standard training when CUDA is not available
-            outputs, side_outputs = model(inputs)
-            loss = compute_loss(outputs, side_outputs, targets, model)
+            outputs = model(inputs)
+            loss = compute_loss(outputs, targets)
             loss.backward()
             optimizer.step()
 
-        scheduler.step()
-
         running_loss += loss.item()
 
-        outputs_float = outputs.detach().float()
-        targets_float = targets.float()
+        outputs_float = outputs.detach().float().clamp(0, 1)
+        targets_float = targets.float().clamp(0, 1)
 
         psnr = calculate_psnr(outputs_float, targets_float)
-        ssim_value = ssim(outputs_float.clamp(0, 1), targets_float.clamp(0, 1), data_range=1.0, size_average=True)
+        ssim_value = ssim(outputs_float, targets_float, data_range=1.0, size_average=True)
 
         if not torch.isnan(psnr) and not torch.isinf(psnr):
             running_psnr += psnr.item()
         if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
             running_ssim += ssim_value.item()
 
-        if batch_idx % 10 == 0:
+        if batch_idx % 100 == 0:
             visualize_batch(inputs, targets, outputs_float, epoch, batch_idx, writer)
 
     epoch_loss = running_loss / len(train_loader)
@@ -253,6 +278,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, scaler, device, epoch
     epoch_ssim = running_ssim / len(train_loader)
 
     return epoch_loss, epoch_psnr, epoch_ssim
+
 
 def validate(model, val_loader, device, epoch, writer):
     model.eval()
@@ -266,14 +292,14 @@ def validate(model, val_loader, device, epoch, writer):
 
             if torch.cuda.is_available() and autocast is not None:
                 with autocast():
-                    outputs, side_outputs = model(inputs)
+                    outputs = model(inputs)
             else:
-                outputs, side_outputs = model(inputs)
+                outputs = model(inputs)
 
             outputs_float = outputs.detach().float().clamp(0, 1)
-            targets_float = targets.float()
+            targets_float = targets.float().clamp(0, 1)
 
-            loss = compute_loss(outputs_float, side_outputs, targets_float, model)
+            loss = compute_loss(outputs_float, targets_float)
 
             if not torch.isnan(loss) and not torch.isinf(loss):
                 val_loss += loss.item()
@@ -295,6 +321,7 @@ def validate(model, val_loader, device, epoch, writer):
 
     return (val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader))
 
+
 def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, device, writer):
     if torch.cuda.is_available():
         scaler = GradScaler()
@@ -302,12 +329,12 @@ def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, dev
         scaler = None
 
     best_val_loss = float('inf')
-    patience = 30
+    patience = 15
     patience_counter = 0
 
     for epoch in range(num_epochs):
         train_loss, train_psnr, train_ssim = train_epoch(
-            model, train_loader, optimizer, scheduler, scaler, device, epoch, writer
+            model, train_loader, optimizer, device, epoch, writer, scaler
         )
 
         val_loss, val_psnr, val_ssim = validate(model, val_loader, device, epoch, writer)
@@ -323,12 +350,12 @@ def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, dev
         writer.add_scalar('Validation/PSNR', val_psnr, epoch)
         writer.add_scalar('Validation/SSIM', val_ssim, epoch)
 
-        scheduler.step()
+        scheduler.step(val_loss)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, epoch, val_loss)
+            save_checkpoint(model, optimizer, epoch, val_loss, filename='best_checkpoint.pth')
         else:
             patience_counter += 1
 
@@ -337,20 +364,24 @@ def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, dev
             break
 
         if (epoch + 1) % 10 == 0:
-            save_checkpoint(model, optimizer, epoch, train_loss)
+            save_checkpoint(model, optimizer, epoch, train_loss, filename=f'checkpoint_epoch_{epoch + 1}.pth')
 
     print("Training completed successfully!")
+
 
 def main():
     torch.manual_seed(42)
     np.random.seed(42)
+    random.seed(42)
 
     config = {
-        'batch_size': 16,
-        'num_epochs': 50,
+        'batch_size': 16,  # Adjust based on your GPU memory
+        'num_epochs': 100,
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
         'weight_decay': 1e-5,
+        'num_adjacent_slices': 3,  # Use 3 or more slices
+        'augment': True,
     }
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -359,32 +390,46 @@ def main():
     train_root_dir = '../data/brats18/train/combined/'
     val_root_dir = '../data/brats18/val/'
 
-    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'])
-    val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'])
+    train_dataset = BrainMRI2DDataset(
+        train_root_dir, config['slice_range'],
+        num_adjacent_slices=config['num_adjacent_slices'],
+        augment=config['augment']
+    )
+    val_dataset = BrainMRI2DDataset(
+        val_root_dir, config['slice_range'],
+        num_adjacent_slices=config['num_adjacent_slices'],
+        augment=False
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4,
                               pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
-    model = UNet2D(in_channels=3, out_channels=1, init_features=32).to(device)
+    num_modalities = 3  # FLAIR, T1c, T2
+    num_slices = config['num_adjacent_slices']
+    in_channels = num_modalities * num_slices
 
-    optimizer, scheduler = get_optimizer_and_scheduler(model, config, train_loader)
+    model = UNet2D(in_channels=in_channels, out_channels=1, init_features=32).to(device)
 
-    writer = SummaryWriter('runs/2d_unet_se_prog')
+    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
-    start_epoch = load_checkpoint(model, optimizer)
+    writer = SummaryWriter('runs/2d_unet_updated')
+
+    start_epoch = 0  # If you have a checkpoint, you can load it here
 
     train(
         model, train_loader, val_loader, optimizer, scheduler,
         config['num_epochs'] - start_epoch, device, writer
     )
 
-    torch.save(model.state_dict(), '2d_unet_model_se_prog.pth')
+    torch.save(model.state_dict(), '2d_unet_model_updated.pth')
 
-    with open('patient_normalization_params_2d_se_prog.json', 'w') as f:
+    with open('patient_normalization_params.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
+
 
 if __name__ == '__main__':
     main()
