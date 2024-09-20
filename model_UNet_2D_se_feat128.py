@@ -46,7 +46,7 @@ class ConvBlock(nn.Module):
 
 
 class UNet2D(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, init_features=64, dropout_rate=0.1):
+    def __init__(self, in_channels=3, out_channels=1, init_features=128, dropout_rate=0.1):
         super(UNet2D, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels

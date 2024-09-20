@@ -7,37 +7,23 @@ import numpy as np
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_UNet_2D_se_feat256 import UNet2D, calculate_psnr, CombinedLoss
+from model_UNet_2D_se_feat64 import UNet2D, calculate_psnr, CombinedLoss
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim
 import json
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import OneCycleLR
-from torchvision import transforms
-from torchvision.transforms import RandomHorizontalFlip, RandomVerticalFlip, RandomRotation, RandomAffine
 
-
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 class BrainMRI2DDataset(Dataset):
-    def __init__(self, root_dir, slice_range=(2, 150), corrupt_threshold=1e-6, is_train=True):
+    def __init__(self, root_dir, slice_range=(2, 150), corrupt_threshold=1e-6):
         self.root_dir = root_dir
         self.slice_range = slice_range
         self.corrupt_threshold = corrupt_threshold
         self.data_list = self.parse_dataset()
         self.valid_slices = self.identify_valid_slices()
         self.normalization_params = {}
-        self.is_train = is_train
-        if self.is_train:
-            self.augment = transforms.Compose([
-                RandomHorizontalFlip(),
-                RandomVerticalFlip(),
-                RandomRotation(15),
-                RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1))
-            ])
-        else:
-            self.augment = None
 
     def parse_dataset(self):
         data_list = []
@@ -93,19 +79,15 @@ class BrainMRI2DDataset(Dataset):
         data_idx, slice_idx = self.valid_slices[idx]
         data_entry = self.data_list[data_idx]
 
-
-
         # Load all modalities
         flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))[slice_idx]
         t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))[slice_idx]
         t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))[slice_idx]
         t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))[slice_idx]
 
-
-
+        # Stack input modalities
         input_slice = np.stack([flair, t1c, t2], axis=0)
         target_slice = t1[np.newaxis, ...]
-
 
         input_slice = torch.from_numpy(input_slice).float()
         target_slice = torch.from_numpy(target_slice).float()
@@ -113,15 +95,6 @@ class BrainMRI2DDataset(Dataset):
         # Normalize input and target
         input_slice, input_min, input_max = self.normalize_slice(input_slice)
         target_slice, target_min, target_max = self.normalize_slice(target_slice)
-
-        if self.is_train and self.augment:
-            # Apply the same augmentation to both input and target
-            seed = torch.randint(0, 2**32, (1,)).item()
-            torch.manual_seed(seed)
-            input_slice = self.augment(input_slice)
-            torch.manual_seed(seed)
-            target_slice = self.augment(target_slice)
-
 
         patient_id = f"patient_{data_idx}"
         if patient_id not in self.normalization_params:
@@ -180,7 +153,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_f256.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_f64.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -190,7 +163,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_2d_se_f2
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_f256.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_f64.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -207,11 +180,15 @@ def load_checkpoint(model, optimizer, filename="checkpoint_2d_se_f256.pth"):
 
 def get_optimizer_and_scheduler(model, config, train_loader):
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-    scheduler = CosineAnnealingWarmRestarts(
+    scheduler = OneCycleLR(
         optimizer,
-        T_0=10,  # Number of iterations for the first restart
-        T_mult=2,  # A factor increases T_i after a restart
-        eta_min=1e-6  # Minimum learning rate
+        max_lr=config['learning_rate'],
+        epochs=config['num_epochs'],
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+        anneal_strategy='cos',
+        div_factor=25.0,
+        final_div_factor=10000.0
     )
     return optimizer, scheduler
 
@@ -221,25 +198,23 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, de
     running_loss = 0.0
     running_psnr = 0.0
     running_ssim = 0.0
-    accumulation_steps = 4  # Adjust this value as needed
 
     for batch_idx, (inputs, targets, indices) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
         inputs, targets = inputs.to(device), targets.to(device)
 
+        optimizer.zero_grad()
         with autocast(device_type='cuda'):
             outputs, loss, _ = model(inputs, targets)
-            loss = loss / accumulation_steps
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
-        if (batch_idx + 1) % accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step()
-            running_loss += loss.item() * accumulation_steps
+        scheduler.step()
+
+        running_loss += loss.item()
 
         outputs_float = outputs.float()
         targets_float = targets.float()
@@ -348,40 +323,39 @@ def main():
     config = {
         'batch_size': 16,
         'num_epochs': 50,
-        'learning_rate': 5e-5,
+        'learning_rate': 1e-4,
         'slice_range': (2, 150),
         'weight_decay': 1e-5,
     }
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
     val_root_dir = '../data/brats18/val/'
 
-    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'], is_train=True)
-    val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'], is_train=False)
+    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'])
+    val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'])
 
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4,
                               pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
-    # Here make sure the number of init features is matching from the model.py
-    model = UNet2D(in_channels=3, out_channels=1, init_features=64).to(device)
+    model = UNet2D(in_channels=3, out_channels=1, init_features=32).to(device)
 
     criterion = CombinedLoss().to(device)
     optimizer, scheduler = get_optimizer_and_scheduler(model, config, train_loader)
 
-    writer = SummaryWriter('runs/2d_unet_se_f256')
+    writer = SummaryWriter('runs/2d_unet_se_f64')
 
     start_epoch = load_checkpoint(model, optimizer)
 
     train(model, train_loader, val_loader, criterion, optimizer, scheduler, config['num_epochs'] - start_epoch, device,
           writer)
 
-    torch.save(model.state_dict(), '2d_unet_model_se_f256.pth')
+    torch.save(model.state_dict(), '2d_unet_model_se_f64.pth')
 
-    with open('patient_normalization_params_2d_se_f256.json', 'w') as f:
+    with open('patient_normalization_params_2d_se_f64.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
