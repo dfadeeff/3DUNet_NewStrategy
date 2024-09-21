@@ -1,11 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
-import numpy as np
-from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-
+import torch.nn.functional as F
 
 class AttentionBlock(nn.Module):
     def __init__(self, channels):
@@ -27,7 +22,6 @@ class AttentionBlock(nn.Module):
         out = out.view(batch_size, C, width, height)
         return self.gamma * out + x
 
-
 class ConditionalFlowBlock(nn.Module):
     def __init__(self, channels):
         super(ConditionalFlowBlock, self).__init__()
@@ -45,7 +39,6 @@ class ConditionalFlowBlock(nn.Module):
         out = self.norm(out)
         out = out + condition
         return self.activation(out + residual)
-
 
 class AdvancedMRITranslationModel(nn.Module):
     def __init__(self, in_channels=3, out_channels=1, features=64):
@@ -94,15 +87,20 @@ class AdvancedMRITranslationModel(nn.Module):
         self.condition_net = nn.Sequential(
             nn.Conv2d(in_channels, features, kernel_size=1),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(features, features * 4, kernel_size=1)
+            nn.Conv2d(features, features * 2, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(features * 2),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(features * 2, features * 4, kernel_size=3, stride=2, padding=1),
+            nn.InstanceNorm2d(features * 4),
+            nn.LeakyReLU(0.2)
         )
 
     def forward(self, x):
-        condition = self.condition_net(x)
-
         e1 = self.encoder1(x)
         e2 = self.encoder2(e1)
         e3 = self.encoder3(e2)
+
+        condition = self.condition_net(x)
 
         flow = self.flow1(e3, condition)
         flow = self.flow2(flow, condition)
@@ -118,109 +116,12 @@ class AdvancedMRITranslationModel(nn.Module):
 
         return d1
 
-
-class BraTSDataset(Dataset):
-    def __init__(self, data_path, transform=None):
-        self.data_path = data_path
-        self.transform = transform
-        # Load your data here (e.g., file paths for T1c, T2, FLAIR, and T1)
-        # This is a placeholder; you'll need to implement actual data loading
-        self.data = []
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        t1c, t2, flair, t1 = self.data[idx]
-        # Load and preprocess the images
-        # This is a placeholder; you'll need to implement actual image loading
-        input_image = np.stack([t1c, t2, flair], axis=0)
-        target_image = t1
-
-        if self.transform:
-            input_image = self.transform(input_image)
-            target_image = self.transform(target_image)
-
-        return input_image, target_image
-
-
-def train_model(model, train_loader, val_loader, num_epochs, device):
-    criterion = nn.L1Loss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-
-    for epoch in range(num_epochs):
-        model.train()
-        train_loss = 0.0
-
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item()
-
-        train_loss /= len(train_loader)
-
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        val_psnr = 0.0
-        val_ssim = 0.0
-
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                val_loss += criterion(outputs, targets).item()
-
-                # Calculate PSNR and SSIM
-                for output, target in zip(outputs.cpu().numpy(), targets.cpu().numpy()):
-                    val_psnr += peak_signal_noise_ratio(target[0], output[0])
-                    val_ssim += structural_similarity(target[0], output[0])
-
-        val_loss /= len(val_loader)
-        val_psnr /= len(val_loader.dataset)
-        val_ssim /= len(val_loader.dataset)
-
-        print(f"Epoch {epoch + 1}/{num_epochs}")
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val Loss: {val_loss:.4f}, PSNR: {val_psnr:.2f}, SSIM: {val_ssim:.4f}")
-
-        scheduler.step()
-
-
-def main():
-    # Hyperparameters
-    batch_size = 16
-    num_epochs = 200
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Create datasets and dataloaders
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
-    ])
-
-    train_dataset = BraTSDataset("path/to/train/data", transform=transform)
-    val_dataset = BraTSDataset("path/to/val/data", transform=transform)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-    # Create model
-    model = AdvancedMRITranslationModel().to(device)
-
-    # Train model
-    train_model(model, train_loader, val_loader, num_epochs, device)
-
-    # Save the trained model
-    torch.save(model.state_dict(), "advanced_mri_translation_model.pth")
-
+def test_model():
+    model = AdvancedMRITranslationModel()
+    x = torch.randn(1, 3, 240, 240)  # Example input tensor
+    y = model(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {y.shape}")
 
 if __name__ == "__main__":
-    main()
+    test_model()
