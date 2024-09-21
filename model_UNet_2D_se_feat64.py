@@ -284,4 +284,6 @@ def test_model():
 
 
 if __name__ == "__main__":
-    test_model()
+    #test_model()
+    model =UNet2D(in_channels=3, out_channels=1, init_features=64)
+    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
