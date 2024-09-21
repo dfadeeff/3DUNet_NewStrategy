@@ -379,7 +379,7 @@ def main():
     np.random.seed(42)
 
     config = {
-        'batch_size': 8,
+        'batch_size': 16,
         'num_epochs': 50,
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
@@ -389,7 +389,7 @@ def main():
         'lambda_ssim': 10,
     }
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
