@@ -342,7 +342,7 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, crite
     for epoch in range(num_epochs):
         g_loss, d_loss, train_psnr, train_ssim = train_epoch(generator, discriminator, train_loader, criterion_G,
                                                              criterion_D, optimizer_G, optimizer_D, scaler, device,
-                                                             epoch, writer, config, ssim_module)
+                                                                 epoch, writer, config, ssim_module)
 
         val_loss, val_psnr, val_ssim = validate(generator, val_loader, criterion_G, device, epoch, writer, config,
                                                 ssim_module)
