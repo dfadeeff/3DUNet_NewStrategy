@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_2D_cGAN_Enhance import GeneratorUNet, Discriminator, PerceptualLoss
+from model_2D_cGAN_updated import GeneratorUNet, Discriminator, PerceptualLoss
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
@@ -90,31 +90,16 @@ class BrainMRI2DDataset(Dataset):
             input_volume = np.stack([flair, t1c, t2], axis=1)  # Shape: [slices, modalities, H, W]
             target_volume = t1  # Shape: [slices, H, W]
 
-            # Compute per-patient normalization parameters
-            # Flatten the volumes to compute percentiles
-            input_flat = input_volume.reshape(-1)
-            target_flat = target_volume.reshape(-1)
-
             # Compute percentiles
-            input_lower = np.percentile(input_flat, 1)
-            input_upper = np.percentile(input_flat, 99)
-            target_lower = np.percentile(target_flat, 1)
-            target_upper = np.percentile(target_flat, 99)
+            input_lower = np.percentile(input_volume, 1)
+            input_upper = np.percentile(input_volume, 99)
+            target_lower = np.percentile(target_volume, 1)
+            target_upper = np.percentile(target_volume, 99)
 
-            # Clip intensities
-            input_clipped = np.clip(input_flat, input_lower, input_upper)
-            target_clipped = np.clip(target_flat, target_lower, target_upper)
-
-            # Compute mean and std
-            input_mean = input_clipped.mean()
-            input_std = input_clipped.std()
-            target_mean = target_clipped.mean()
-            target_std = target_clipped.std()
-
-            # Store in normalization_params
+            # Store min and max values
             self.normalization_params[patient_id] = {
-                'input': {'mean': input_mean, 'std': input_std},
-                'target': {'mean': target_mean, 'std': target_std}
+                'input': {'min': input_lower, 'max': input_upper},
+                'target': {'min': target_lower, 'max': target_upper}
             }
 
     def __len__(self):
@@ -135,23 +120,26 @@ class BrainMRI2DDataset(Dataset):
         input_slice = np.stack([flair, t1c, t2], axis=0)
         target_slice = t1[np.newaxis, ...]
 
+        # Normalize using min-max scaling to [-1, 1]
+        input_min = self.normalization_params[patient_id]['input']['min']
+        input_max = self.normalization_params[patient_id]['input']['max']
+        target_min = self.normalization_params[patient_id]['target']['min']
+        target_max = self.normalization_params[patient_id]['target']['max']
+
+        input_range = input_max - input_min
+        if input_range == 0:
+            input_range = 1.0  # Avoid division by zero
+
+        target_range = target_max - target_min
+        if target_range == 0:
+            target_range = 1.0
+
+        input_slice = 2 * (input_slice - input_min) / input_range - 1
+        target_slice = 2 * (target_slice - target_min) / target_range - 1
+
         # Convert to tensors
         input_slice = torch.from_numpy(input_slice).float()
         target_slice = torch.from_numpy(target_slice).float()
-
-        # Normalize using per-patient mean and std
-        input_mean = self.normalization_params[patient_id]['input']['mean']
-        input_std = self.normalization_params[patient_id]['input']['std']
-        target_mean = self.normalization_params[patient_id]['target']['mean']
-        target_std = self.normalization_params[patient_id]['target']['std']
-
-        # Avoid division by zero
-        input_std = input_std if input_std > 0 else 1.0
-        target_std = target_std if target_std > 0 else 1.0
-
-        # Apply Z-score normalization
-        input_slice = (input_slice - input_mean) / input_std
-        target_slice = (target_slice - target_mean) / target_std
 
         # Apply data augmentation if enabled
         if self.transform:
@@ -247,6 +235,11 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, criterion_D
     running_psnr = 0.0
     running_ssim = 0.0
 
+    running_g_adv_loss = 0.0
+    running_g_l1_loss = 0.0
+    running_g_perc_loss = 0.0
+    running_g_ssim_loss = 0.0
+
     for batch_idx, (inputs, targets, indices) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
         inputs, targets = inputs.to(device), targets.to(device)
 
@@ -306,7 +299,7 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, criterion_D
 
             # Total generator loss
             g_loss = (
-                    g_adv_loss +
+                    config['lambda_adv'] * g_adv_loss +
                     config['lambda_l1'] * g_l1_loss +
                     config['lambda_perceptual'] * g_perc_loss +
                     config['lambda_ssim'] * g_ssim_loss
@@ -319,6 +312,11 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, criterion_D
         # Logging
         running_g_loss += g_loss.item()
         running_d_loss += d_loss.item()
+
+        running_g_adv_loss += (config['lambda_adv'] * g_adv_loss).item()
+        running_g_l1_loss += (config['lambda_l1'] * g_l1_loss).item()
+        running_g_perc_loss += (config['lambda_perceptual'] * g_perc_loss).item()
+        running_g_ssim_loss += (config['lambda_ssim'] * g_ssim_loss).item()
 
         # Calculate PSNR and SSIM
         outputs_float = fake_targets.float()
@@ -341,7 +339,12 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, criterion_D
     epoch_psnr = running_psnr / len(train_loader)
     epoch_ssim = running_ssim / len(train_loader)
 
-    return epoch_g_loss, epoch_d_loss, epoch_psnr, epoch_ssim
+    epoch_g_adv_loss = running_g_adv_loss / len(train_loader)
+    epoch_g_l1_loss = running_g_l1_loss / len(train_loader)
+    epoch_g_perc_loss = running_g_perc_loss / len(train_loader)
+    epoch_g_ssim_loss = running_g_ssim_loss / len(train_loader)
+
+    return epoch_g_loss, epoch_d_loss, epoch_psnr, epoch_ssim, epoch_g_adv_loss, epoch_g_l1_loss, epoch_g_perc_loss, epoch_g_ssim_loss
 
 
 def validate(generator, val_loader, criterion_G, device, epoch, writer, config, ssim_module):
@@ -401,9 +404,10 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, crite
     patience_counter = 0
 
     for epoch in range(num_epochs):
-        g_loss, d_loss, train_psnr, train_ssim = train_epoch(generator, discriminator, train_loader, criterion_G,
-                                                             criterion_D, optimizer_G, optimizer_D, scaler, device,
-                                                                 epoch, writer, config, ssim_module)
+        g_loss, d_loss, train_psnr, train_ssim, epoch_g_adv_loss, epoch_g_l1_loss, epoch_g_perc_loss, epoch_g_ssim_loss = train_epoch(
+            generator, discriminator, train_loader, criterion_G,
+            criterion_D, optimizer_G, optimizer_D, scaler, device,
+            epoch, writer, config, ssim_module)
 
         val_loss, val_psnr, val_ssim = validate(generator, val_loader, criterion_G, device, epoch, writer, config,
                                                 ssim_module)
@@ -419,6 +423,11 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, crite
         writer.add_scalar('Validation/Loss', val_loss, epoch)
         writer.add_scalar('Validation/PSNR', val_psnr, epoch)
         writer.add_scalar('Validation/SSIM', val_ssim, epoch)
+
+        writer.add_scalar('Training/G_Adv_Loss', epoch_g_adv_loss, epoch)
+        writer.add_scalar('Training/G_L1_Loss', epoch_g_l1_loss, epoch)
+        writer.add_scalar('Training/G_Perc_Loss', epoch_g_perc_loss, epoch)
+        writer.add_scalar('Training/G_SSIM_Loss', epoch_g_ssim_loss, epoch)
 
         # Early stopping and checkpointing
         if val_loss < best_val_loss:
@@ -443,11 +452,11 @@ def main():
         'batch_size': 16,  # Adjust batch size according to GPU memory
         'num_epochs': 100,  # Increase number of epochs
         'learning_rate_G': 1e-4,
-        'learning_rate_D': 1e-5,  # Lower learning rate for Discriminator
+        'learning_rate_D': 1e-5,  # Lower to slow down discriminator learning
         'slice_range': (2, 150),
-        'lambda_adv': 1,  # Adjusted adversarial loss weight
-        'lambda_l1': 100,
-        'lambda_perceptual': 0.1,
+        'lambda_adv': 5,  # Adjusted adversarial loss weight
+        'lambda_l1': 10,
+        'lambda_perceptual': 1,
         'lambda_ssim': 10,
     }
 
@@ -457,15 +466,15 @@ def main():
     train_root_dir = '../data/brats18/train/combined/'
     val_root_dir = '../data/brats18/val/'
 
-    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'])
-    val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'])
+    train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'], augment=True)
+    val_dataset = BrainMRI2DDataset(val_root_dir, config['slice_range'], augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4,
                               pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
     # Initialize models
-    generator = GeneratorUNet(in_channels=3, out_channels=1, features=256).to(device)
+    generator = GeneratorUNet(in_channels=3, out_channels=1, features=128).to(device)
     discriminator = Discriminator(in_channels=4).to(device)
 
     # Loss functions
