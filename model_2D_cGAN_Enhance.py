@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+from torch.nn.utils import spectral_norm
 
 
 class AttentionBlock(nn.Module):
@@ -117,20 +118,21 @@ class Discriminator(nn.Module):
             if idx == 0:
                 layers.append(
                     nn.Sequential(
-                        nn.Conv2d(in_channels, feature, kernel_size=4, stride=2, padding=1),
+                        spectral_norm(nn.Conv2d(in_channels, feature, kernel_size=4, stride=2, padding=1)),
                         nn.LeakyReLU(0.2, inplace=True)
                     )
                 )
             else:
                 layers.append(
                     nn.Sequential(
-                        nn.Conv2d(features[idx - 1], feature, kernel_size=4, stride=2, padding=1, bias=False),
-                        nn.BatchNorm2d(feature),
+                        spectral_norm(
+                            nn.Conv2d(features[idx - 1], feature, kernel_size=4, stride=2, padding=1, bias=False)),
+                        nn.InstanceNorm2d(feature),
                         nn.LeakyReLU(0.2, inplace=True)
                     )
                 )
         layers.append(
-            nn.Conv2d(features[-1], 1, kernel_size=4, padding=1)
+            spectral_norm(nn.Conv2d(features[-1], 1, kernel_size=4, padding=1))
         )
         self.model = nn.Sequential(*layers)
 
