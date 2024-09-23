@@ -32,6 +32,8 @@ class BrainMRI2DDataset(Dataset):
             transforms.RandomVerticalFlip(),
             transforms.RandomRotation(15),
             transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.RandomApply([transforms.GaussianBlur(3)], p=0.1),
         ]) if self.augment else None
 
         # Compute normalization parameters per patient
@@ -197,7 +199,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
 
 
 def save_checkpoint(generator, discriminator, optimizer_G, optimizer_D, epoch, loss,
-                    filename="checkpoint_cgan__updated.pth"):
+                    filename="checkpoint_cgan_GLoss.pth"):
     torch.save({
         'epoch': epoch,
         'generator_state_dict': generator.state_dict(),
@@ -209,7 +211,7 @@ def save_checkpoint(generator, discriminator, optimizer_G, optimizer_D, epoch, l
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(generator, discriminator, optimizer_G, optimizer_D, filename="checkpoint_cgan__updated.pth"):
+def load_checkpoint(generator, discriminator, optimizer_G, optimizer_D, filename="checkpoint_cgan_GLoss.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -454,13 +456,13 @@ def main():
         'learning_rate_G': 1e-4,
         'learning_rate_D': 1e-5,  # Lower to slow down discriminator learning
         'slice_range': (2, 150),
-        'lambda_adv': 5,  # Adjusted adversarial loss weight
+        'lambda_adv': 10,  # Adjusted adversarial loss weight
         'lambda_l1': 10,
-        'lambda_perceptual': 1,
+        'lambda_perceptual': 5,
         'lambda_ssim': 10,
     }
 
-    device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -474,18 +476,18 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
     # Initialize models
-    generator = GeneratorUNet(in_channels=3, out_channels=1, features=256).to(device)
+    generator = GeneratorUNet(in_channels=3, out_channels=1, features=128).to(device)
     discriminator = Discriminator(in_channels=4).to(device)
 
     # Loss functions
-    criterion_D = nn.MSELoss().to(device)  # LSGAN loss
+    criterion_D = nn.BCEWithLogitsLoss().to(device)
     criterion_G = PerceptualLoss().to(device)
 
     # Optimizers
-    optimizer_G = optim.Adam(generator.parameters(), lr=config['learning_rate_G'], betas=(0.5, 0.999))
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=config['learning_rate_D'], betas=(0.5, 0.999))
+    optimizer_G = optim.Adam(generator.parameters(), lr=config['learning_rate_G'], betas=(0.9, 0.999), weight_decay=1e-5)
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=config['learning_rate_D'], betas=(0.9, 0.999), weight_decay=1e-5)
 
-    writer = SummaryWriter('runs/cgan_training_updated')
+    writer = SummaryWriter('runs/cgan_training_GLoss')
 
     # Initialize SSIM module once with channel=1
     ssim_module = SSIM(data_range=2.0, channel=1).to(device)
@@ -495,10 +497,10 @@ def main():
     train(generator, discriminator, train_loader, val_loader, criterion_G, criterion_D, optimizer_G, optimizer_D,
           config['num_epochs'] - start_epoch, device, writer, config, ssim_module)
 
-    torch.save(generator.state_dict(), 'generator_updated.pth')
-    torch.save(discriminator.state_dict(), 'discriminator__updated.pth')
+    torch.save(generator.state_dict(), 'generator_GLoss.pth')
+    torch.save(discriminator.state_dict(), 'discriminator__GLoss.pth')
 
-    with open('patient_normalization_params_cgan__updated.json', 'w') as f:
+    with open('patient_normalization_params_cgan_GLoss.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
