@@ -13,7 +13,7 @@ from pytorch_msssim import ssim, SSIM
 import json
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import OneCycleLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from skimage.metrics import peak_signal_noise_ratio as calculate_psnr
 import random
 import scipy.ndimage as ndi
