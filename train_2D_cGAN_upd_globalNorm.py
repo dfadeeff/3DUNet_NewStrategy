@@ -72,6 +72,14 @@ class BrainMRI2DDataset(Dataset):
         self.global_target_min = global_target_min
         self.global_target_max = global_target_max
 
+        # **Add normalization_params attribute**
+        self.normalization_params = {
+            'global_input_min': global_input_min,
+            'global_input_max': global_input_max,
+            'global_target_min': global_target_min,
+            'global_target_max': global_target_max
+        }
+
     def parse_dataset(self):
         data_list = []
         for subject_folder in sorted(os.listdir(self.root_dir)):
@@ -251,7 +259,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
 
 
 def save_checkpoint(generator, discriminator, optimizer_G, optimizer_D, epoch, loss,
-                    filename="checkpoint_cgan_globalNorm.pth"):
+                    filename="checkpoint_cgan_globalNormV2.pth"):
     torch.save({
         'epoch': epoch,
         'generator_state_dict': generator.state_dict(),
@@ -263,7 +271,7 @@ def save_checkpoint(generator, discriminator, optimizer_G, optimizer_D, epoch, l
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(generator, discriminator, optimizer_G, optimizer_D, filename="checkpoint_cgan_globalNorm.pth"):
+def load_checkpoint(generator, discriminator, optimizer_G, optimizer_D, filename="checkpoint_cgan_globalNormV2.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -456,7 +464,7 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, crite
           num_epochs, device, writer, config, ssim_module):
     scaler = GradScaler(enabled=torch.cuda.is_available())
     best_val_loss = float('inf')
-    patience = 15
+    patience = 25
     patience_counter = 0
 
     for epoch in range(num_epochs):
@@ -508,12 +516,12 @@ def main():
         'batch_size': 16,  # Adjust batch size according to GPU memory
         'num_epochs': 100,  # Increase number of epochs
         'learning_rate_G': 1e-4,
-        'learning_rate_D': 1e-5,  # Lower to slow down discriminator learning
+        'learning_rate_D': 1e-4,  # Lower to slow down discriminator learning
         'slice_range': (2, 150),
-        'lambda_adv': 10,  # Adjusted adversarial loss weight
-        'lambda_l1': 1,
+        'lambda_adv': 5,  # Adjusted adversarial loss weight
+        'lambda_l1': 5,
         'lambda_perceptual': 10,
-        'lambda_ssim': 10,
+        'lambda_ssim': 5,
     }
 
     device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
@@ -556,7 +564,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
     # Initialize models
-    generator = GeneratorUNet(in_channels=3, out_channels=1, features=128).to(device)
+    generator = GeneratorUNet(in_channels=3, out_channels=1, features=64).to(device)
     discriminator = Discriminator(in_channels=4).to(device)
 
     # Loss functions
@@ -569,7 +577,7 @@ def main():
     optimizer_D = optim.Adam(discriminator.parameters(), lr=config['learning_rate_D'], betas=(0.9, 0.999),
                              weight_decay=1e-4)
 
-    writer = SummaryWriter('runs/cgan_globalNorm')
+    writer = SummaryWriter('runs/cgan_globalNormV2')
 
     # Initialize SSIM module once with channel=1
     ssim_module = SSIM(data_range=2.0, channel=1).to(device)
@@ -579,10 +587,10 @@ def main():
     train(generator, discriminator, train_loader, val_loader, criterion_G, criterion_D, optimizer_G, optimizer_D,
           config['num_epochs'] - start_epoch, device, writer, config, ssim_module)
 
-    torch.save(generator.state_dict(), 'generator_globalNorm.pth')
-    torch.save(discriminator.state_dict(), 'discriminator_globalNorm.pth')
+    torch.save(generator.state_dict(), 'generator_globalNormV2.pth')
+    torch.save(discriminator.state_dict(), 'discriminator_globalNormV2.pth')
 
-    with open('patient_normalization_params_cgan_globalNorm.json', 'w') as f:
+    with open('patient_normalization_params_cgan_globalNormV2.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
