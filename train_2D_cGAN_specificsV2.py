@@ -10,24 +10,12 @@ import os
 import SimpleITK as sitk
 from model_2D_cGAN_upd_globalNormV2 import GeneratorResNet, DiscriminatorWGANGP, PerceptualLoss
 import matplotlib.pyplot as plt
-from pytorch_msssim import ssim, SSIM, MS_SSIM
+from pytorch_msssim import MS_SSIM
 import json
 from torch.amp import GradScaler, autocast
 import torchvision.transforms as transforms
 import random
 import scipy.ndimage as ndi
-
-def add_gaussian_noise(img):
-    if random.random() < 0.5:
-        return img + 0.05 * torch.randn_like(img)
-    else:
-        return img
-
-def random_intensity_scaling(img):
-    if random.random() < 0.5:
-        return img * (0.9 + 0.2 * torch.rand(1))
-    else:
-        return img
 
 
 class ElasticTransform2D:
@@ -57,6 +45,20 @@ class ElasticTransform2D:
             transformed_img[i] = transformed_channel
 
         return torch.from_numpy(transformed_img)
+
+
+def add_gaussian_noise(img):
+    if random.random() < 0.5:
+        return img + 0.05 * torch.randn_like(img)
+    else:
+        return img
+
+
+def random_intensity_scaling(img):
+    if random.random() < 0.5:
+        return img * (0.9 + 0.2 * torch.rand(1))
+    else:
+        return img
 
 
 class BrainMRI2DDataset(Dataset):
@@ -305,129 +307,6 @@ def load_checkpoint(generator, discriminator, optimizer_G, optimizer_D,
         return 0
 
 
-def train_epoch(generator, discriminator, train_loader, criterion_G, criterion_D, optimizer_G, optimizer_D, scaler,
-                device, epoch, writer, config, ssim_module):
-    generator.train()
-    discriminator.train()
-    running_g_loss = 0.0
-    running_d_loss = 0.0
-    running_psnr = 0.0
-    running_ssim = 0.0
-
-    running_g_adv_loss = 0.0
-    running_g_l1_loss = 0.0
-    running_g_perc_loss = 0.0
-    running_g_ssim_loss = 0.0
-
-    for batch_idx, (inputs, targets, indices) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        # ---------------------
-        #  Train Discriminator
-        # ---------------------
-        optimizer_D.zero_grad()
-        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
-            # Generate fake images
-            fake_targets = generator(inputs).detach()  # Detach to avoid backprop through generator
-
-            # Real images
-            real_inputs = torch.cat([inputs, targets], dim=1)
-            real_validity = discriminator(real_inputs)
-
-            # Fake images
-            fake_inputs = torch.cat([inputs, fake_targets], dim=1)
-            fake_validity = discriminator(fake_inputs)
-
-            real_label = 1.0
-            fake_label = 0.0
-            # Create labels with the same size as discriminator outputs
-            valid = torch.full_like(real_validity, real_label, device=device)
-            fake = torch.full_like(fake_validity, fake_label, device=device)
-
-            # Discriminator loss
-            d_real_loss = criterion_D(real_validity, valid)
-            d_fake_loss = criterion_D(fake_validity, fake)
-            d_loss = (d_real_loss + d_fake_loss) / 2
-
-        scaler.scale(d_loss).backward()
-        scaler.step(optimizer_D)
-        scaler.update()
-
-        # -----------------
-        #  Train Generator
-        # -----------------
-        optimizer_G.zero_grad()
-        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
-            # Generate fake images
-            fake_targets = generator(inputs)
-
-            # Fake images for discriminator
-            fake_inputs = torch.cat([inputs, fake_targets], dim=1)
-            fake_validity = discriminator(fake_inputs)
-
-            # Adversarial loss (use valid labels for generator loss)
-            valid = torch.ones_like(fake_validity, device=device)
-            g_adv_loss = criterion_D(fake_validity, valid)
-
-            # L1 loss
-            g_l1_loss = nn.L1Loss()(fake_targets, targets)
-
-            # Perceptual loss
-            g_perc_loss = criterion_G(fake_targets.repeat(1, 3, 1, 1), targets.repeat(1, 3, 1, 1))
-
-            # SSIM loss
-            g_ssim_loss = 1 - ssim_module(fake_targets, targets)
-
-            # Total generator loss
-            g_loss = (
-                    config['lambda_adv'] * g_adv_loss +
-                    config['lambda_l1'] * g_l1_loss +
-                    config['lambda_perceptual'] * g_perc_loss +
-                    config['lambda_ssim'] * g_ssim_loss
-            )
-
-        scaler.scale(g_loss).backward()
-        scaler.step(optimizer_G)
-        scaler.update()
-
-        # Logging
-        running_g_loss += g_loss.item()
-        running_d_loss += d_loss.item()
-
-        running_g_adv_loss += (config['lambda_adv'] * g_adv_loss).item()
-        running_g_l1_loss += (config['lambda_l1'] * g_l1_loss).item()
-        running_g_perc_loss += (config['lambda_perceptual'] * g_perc_loss).item()
-        running_g_ssim_loss += (config['lambda_ssim'] * g_ssim_loss).item()
-
-        # Calculate PSNR and SSIM
-        outputs_float = fake_targets.float()
-        targets_float = targets.float()
-
-        mse_loss = nn.MSELoss()(outputs_float, targets_float)
-        psnr = 10 * torch.log10(4 / mse_loss)
-        ssim_value = ssim(outputs_float, targets_float, data_range=2.0, size_average=True)
-
-        if not torch.isnan(psnr) and not torch.isinf(psnr):
-            running_psnr += psnr.item()
-        if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
-            running_ssim += ssim_value.item()
-
-        if batch_idx % 100 == 0:
-            visualize_batch(inputs, targets, fake_targets, epoch, batch_idx, writer)
-
-    epoch_g_loss = running_g_loss / len(train_loader)
-    epoch_d_loss = running_d_loss / len(train_loader)
-    epoch_psnr = running_psnr / len(train_loader)
-    epoch_ssim = running_ssim / len(train_loader)
-
-    epoch_g_adv_loss = running_g_adv_loss / len(train_loader)
-    epoch_g_l1_loss = running_g_l1_loss / len(train_loader)
-    epoch_g_perc_loss = running_g_perc_loss / len(train_loader)
-    epoch_g_ssim_loss = running_g_ssim_loss / len(train_loader)
-
-    return epoch_g_loss, epoch_d_loss, epoch_psnr, epoch_ssim, epoch_g_adv_loss, epoch_g_l1_loss, epoch_g_perc_loss, epoch_g_ssim_loss
-
-
 def validate(generator, val_loader, criterion_G, device, epoch, writer, config, ms_ssim_module):
     generator.eval()
     val_loss = 0.0
@@ -435,7 +314,7 @@ def validate(generator, val_loader, criterion_G, device, epoch, writer, config, 
     val_ssim = 0.0
 
     with torch.no_grad():
-        for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
+        for batch_idx, (inputs, targets, _) in enumerate(val_loader):
             inputs, targets = inputs.to(device), targets.to(device)
 
             fake_targets = generator(inputs)
@@ -458,10 +337,10 @@ def validate(generator, val_loader, criterion_G, device, epoch, writer, config, 
 
             val_loss += loss.item()
 
-            # Calculate PSNR and SSIM
+            # Calculate PSNR and MS-SSIM
             mse_loss = nn.MSELoss()(fake_targets, targets)
             psnr = 10 * torch.log10(4 / mse_loss)
-            ssim_value = ms_ssim_module(fake_targets, targets, data_range=2.0).item()
+            ssim_value = ms_ssim_module(fake_targets, targets).item()
 
             if not torch.isnan(psnr) and not torch.isinf(psnr):
                 val_psnr += psnr.item()
@@ -471,7 +350,11 @@ def validate(generator, val_loader, criterion_G, device, epoch, writer, config, 
             if batch_idx == 0:
                 visualize_batch(inputs, targets, fake_targets, epoch, batch_idx, writer)
 
-    return (val_loss / len(val_loader), val_psnr / len(val_loader), val_ssim / len(val_loader))
+    val_loss /= len(val_loader)
+    val_psnr /= len(val_loader)
+    val_ssim /= len(val_loader)
+
+    return val_loss, val_psnr, val_ssim
 
 
 def train(generator, discriminator, train_loader, val_loader, criterion_G, optimizer_G, optimizer_D,
@@ -491,15 +374,15 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, optim
         running_psnr = 0.0
         running_ssim = 0.0
 
-        for batch_idx, (inputs, targets, indices) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
+        for batch_idx, (inputs, targets, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
             inputs, targets = inputs.to(device), targets.to(device)
 
             # ---------------------
             #  Train Discriminator
             # ---------------------
+            optimizer_D.zero_grad()
             for _ in range(config['n_critic']):
-                optimizer_D.zero_grad()
-                with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
+                with autocast(enabled=torch.cuda.is_available()):
                     # Generate fake images
                     fake_targets = generator(inputs).detach()
                     fake_inputs = torch.cat([inputs, fake_targets], dim=1)
@@ -531,12 +414,13 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, optim
                 scaler.scale(d_loss).backward()
                 scaler.step(optimizer_D)
                 scaler.update()
+                optimizer_D.zero_grad()  # Zero gradients after each critic update
 
             # -----------------
             #  Train Generator
             # -----------------
             optimizer_G.zero_grad()
-            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
+            with autocast(enabled=torch.cuda.is_available()):
                 # Generate fake images
                 fake_targets = generator(inputs)
                 fake_inputs = torch.cat([inputs, fake_targets], dim=1)
@@ -564,10 +448,10 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, optim
             running_g_loss += g_loss.item()
             running_d_loss += d_loss.item()
 
-            # Calculate PSNR and SSIM
+            # Calculate PSNR and MS-SSIM
             mse_loss = nn.MSELoss()(fake_targets, targets)
             psnr = 10 * torch.log10(4 / mse_loss)
-            ssim_value = ms_ssim_module(fake_targets, targets, data_range=2.0).item()
+            ssim_value = ms_ssim_module(fake_targets, targets).item()
 
             if not torch.isnan(psnr) and not torch.isinf(psnr):
                 running_psnr += psnr.item()
@@ -622,7 +506,7 @@ def evaluate_on_train_data(generator, train_loader_eval, device, epoch, writer, 
     train_ssim = 0.0
 
     with torch.no_grad():
-        for batch_idx, (inputs, targets, indices) in enumerate(train_loader_eval):
+        for batch_idx, (inputs, targets, _) in enumerate(train_loader_eval):
             inputs, targets = inputs.to(device), targets.to(device)
             fake_targets = generator(inputs)
 
@@ -632,7 +516,7 @@ def evaluate_on_train_data(generator, train_loader_eval, device, epoch, writer, 
             ssim_value = ms_ssim_module(fake_targets, targets).item()
 
             if not torch.isnan(psnr) and not torch.isinf(psnr):
-                train_psnr += psnr
+                train_psnr += psnr.item()
             if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
                 train_ssim += ssim_value
 
@@ -725,28 +609,37 @@ def main():
     start_epoch = load_checkpoint(generator, discriminator, optimizer_G, optimizer_D)
 
     if start_epoch == 0:
-        # Pretrain the generator
-        print("Starting generator pretraining...")
-        num_pretrain_epochs = 5
-        scaler = GradScaler(enabled=torch.cuda.is_available())
-        for epoch in range(num_pretrain_epochs):
-            generator.train()
-            running_g_loss = 0.0
-            for batch_idx, (inputs, targets, _) in enumerate(tqdm(train_loader, desc=f"Pretraining Epoch {epoch + 1}")):
-                inputs, targets = inputs.to(device), targets.to(device)
-                optimizer_G.zero_grad()
-                with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
-                    outputs = generator(inputs)
-                    l1_loss = nn.L1Loss()(outputs, targets)
-                scaler.scale(l1_loss).backward()
-                scaler.step(optimizer_G)
-                scaler.update()
-                running_g_loss += l1_loss.item()
+        # Check if pretrained generator exists
+        if os.path.isfile('generator_pretrained.pth'):
+            print("Loading pretrained generator from 'generator_pretrained.pth'")
+            generator.load_state_dict(torch.load('generator_pretrained.pth'))
+        else:
+            # Pretrain the generator
+            print("Starting generator pretraining...")
+            num_pretrain_epochs = 5
+            scaler = GradScaler(enabled=torch.cuda.is_available())
+            for epoch in range(num_pretrain_epochs):
+                generator.train()
+                running_g_loss = 0.0
+                for batch_idx, (inputs, targets, _) in enumerate(
+                        tqdm(train_loader, desc=f"Pretraining Epoch {epoch + 1}")):
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    optimizer_G.zero_grad()
+                    with autocast(enabled=torch.cuda.is_available()):
+                        outputs = generator(inputs)
+                        l1_loss = nn.L1Loss()(outputs, targets)
+                    scaler.scale(l1_loss).backward()
+                    scaler.step(optimizer_G)
+                    scaler.update()
+                    running_g_loss += l1_loss.item()
 
-            epoch_g_loss = running_g_loss / len(train_loader)
-            print(f"Pretraining Epoch [{epoch + 1}/{num_pretrain_epochs}], G Loss: {epoch_g_loss:.4f}")
+                epoch_g_loss = running_g_loss / len(train_loader)
+                print(f"Pretraining Epoch [{epoch + 1}/{num_pretrain_epochs}], G Loss: {epoch_g_loss:.4f}")
 
-        print("Generator pretraining completed.")
+            print("Generator pretraining completed.")
+            # Save the pretrained generator
+            torch.save(generator.state_dict(), 'generator_pretrained.pth')
+            print("Pretrained generator saved to 'generator_pretrained.pth'")
 
     # Start adversarial training
     final_epoch = train(generator, discriminator, train_loader, val_loader, criterion_G, optimizer_G, optimizer_D,
