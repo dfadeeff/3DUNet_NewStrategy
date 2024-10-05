@@ -382,7 +382,8 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, optim
             # ---------------------
             optimizer_D.zero_grad()
             for _ in range(config['n_critic']):
-                with autocast(enabled=torch.cuda.is_available()):
+                with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
+                              enabled=torch.cuda.is_available()):
                     # Generate fake images
                     fake_targets = generator(inputs).detach()
                     fake_inputs = torch.cat([inputs, fake_targets], dim=1)
@@ -420,7 +421,8 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, optim
             #  Train Generator
             # -----------------
             optimizer_G.zero_grad()
-            with autocast(enabled=torch.cuda.is_available()):
+            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
+                          enabled=torch.cuda.is_available()):
                 # Generate fake images
                 fake_targets = generator(inputs)
                 fake_inputs = torch.cat([inputs, fake_targets], dim=1)
@@ -625,7 +627,8 @@ def main():
                         tqdm(train_loader, desc=f"Pretraining Epoch {epoch + 1}")):
                     inputs, targets = inputs.to(device), targets.to(device)
                     optimizer_G.zero_grad()
-                    with autocast(enabled=torch.cuda.is_available()):
+                    with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
+                                  enabled=torch.cuda.is_available()):
                         outputs = generator(inputs)
                         l1_loss = nn.L1Loss()(outputs, targets)
                     scaler.scale(l1_loss).backward()
