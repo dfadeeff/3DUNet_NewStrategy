@@ -17,6 +17,18 @@ import torchvision.transforms as transforms
 import random
 import scipy.ndimage as ndi
 
+def add_gaussian_noise(img):
+    if random.random() < 0.5:
+        return img + 0.05 * torch.randn_like(img)
+    else:
+        return img
+
+def random_intensity_scaling(img):
+    if random.random() < 0.5:
+        return img * (0.9 + 0.2 * torch.rand(1))
+    else:
+        return img
+
 
 class ElasticTransform2D:
     def __init__(self, alpha_range=(30, 40), sigma=5, p=0.5):
@@ -57,17 +69,15 @@ class BrainMRI2DDataset(Dataset):
         self.data_list = self.parse_dataset()
         self.valid_slices = self.identify_valid_slices()
 
-        # Define augmentation transforms (will update in part b)        # Define augmentation transforms
+        # Define augmentation transforms
         self.transform = transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.RandomRotation(5),
             transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
             ElasticTransform2D(alpha_range=(30, 40), sigma=5, p=0.5),
-            transforms.Lambda(lambda img: img + 0.05 * torch.randn_like(img) if random.random() < 0.5 else img),
-            # Add Gaussian noise
-            transforms.Lambda(lambda img: img * (0.9 + 0.2 * torch.rand(1)) if random.random() < 0.5 else img),
-            # Random intensity scaling
+            transforms.Lambda(add_gaussian_noise),
+            transforms.Lambda(random_intensity_scaling),
         ]) if self.augment else None
 
         # Store global normalization parameters
