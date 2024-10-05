@@ -326,7 +326,7 @@ def validate(generator, val_loader, criterion_G, device, epoch, writer, config, 
             perceptual_loss = criterion_G(fake_targets.repeat(1, 3, 1, 1), targets.repeat(1, 3, 1, 1))
 
             # MS-SSIM loss
-            ms_ssim_loss = 1 - ms_ssim_module(fake_targets, targets)
+            ms_ssim_loss = 1 - ms_ssim_module(fake_targets.float(), targets.float())
 
             # Total loss
             loss = (
@@ -340,12 +340,15 @@ def validate(generator, val_loader, criterion_G, device, epoch, writer, config, 
             # Calculate PSNR and MS-SSIM
             mse_loss = nn.MSELoss()(fake_targets, targets)
             psnr = 10 * torch.log10(4 / mse_loss)
-            ssim_value = ms_ssim_module(fake_targets, targets).item()
+            # Ensure MS-SSIM remains as tensor while checking for NaN and inf
+            ssim_value = ms_ssim_module(fake_targets.float(), targets.float())
+
+            # Check if the SSIM value is NaN or inf
+            if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
+                val_ssim += ssim_value.item()
 
             if not torch.isnan(psnr) and not torch.isinf(psnr):
                 val_psnr += psnr.item()
-            if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
-                val_ssim += ssim_value
 
             if batch_idx == 0:
                 visualize_batch(inputs, targets, fake_targets, epoch, batch_idx, writer)
@@ -433,7 +436,8 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, optim
                 # Perceptual loss
                 g_perc_loss = criterion_G(fake_targets.repeat(1, 3, 1, 1), targets.repeat(1, 3, 1, 1))
                 # MS-SSIM loss
-                g_ms_ssim_loss = 1 - ms_ssim_module(fake_targets, targets)
+                g_ms_ssim_loss = 1 - ms_ssim_module(fake_targets.float(), targets.float())  # Fix here
+
                 # Total generator loss
                 g_loss = (
                         config['lambda_adv'] * g_adv_loss +
@@ -453,12 +457,15 @@ def train(generator, discriminator, train_loader, val_loader, criterion_G, optim
             # Calculate PSNR and MS-SSIM
             mse_loss = nn.MSELoss()(fake_targets, targets)
             psnr = 10 * torch.log10(4 / mse_loss)
-            ssim_value = ms_ssim_module(fake_targets, targets).item()
+            # Ensure MS-SSIM remains as tensor while checking for NaN and inf
+            ssim_value = ms_ssim_module(fake_targets.float(), targets.float())
+
+            # Check if the SSIM value is NaN or inf
+            if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
+                running_ssim += ssim_value.item()
 
             if not torch.isnan(psnr) and not torch.isinf(psnr):
                 running_psnr += psnr.item()
-            if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
-                running_ssim += ssim_value
 
             if batch_idx % 100 == 0:
                 visualize_batch(inputs, targets, fake_targets, epoch, batch_idx, writer)
