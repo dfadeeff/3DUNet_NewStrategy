@@ -8,11 +8,12 @@ import torchio as tio
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_2D_fusion import EnhancedGeneratorUNet, PatchGANDiscriminator, PerceptualLoss, WassersteinLoss
+from model_2D_fusion import EnhancedGeneratorUNet, PatchGANDiscriminator, PerceptualLoss, WassersteinLoss, \
+    gradient_penalty
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import torchvision.transforms as transforms
 import random
 import scipy.ndimage as ndi
@@ -318,22 +319,24 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G
         for _ in range(config['n_critic']):
             optimizer_D.zero_grad()
 
-            with autocast(enabled=torch.cuda.is_available()):
+            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
+                          enabled=torch.cuda.is_available()):
                 with torch.no_grad():
                     fake_targets = generator(inputs)
 
-                    real_inputs = torch.cat([inputs, targets], dim=1)
-                    fake_inputs = torch.cat([inputs, fake_targets], dim=1)
+                real_inputs = torch.cat([inputs, targets], dim=1)
+                fake_inputs = torch.cat([inputs, fake_targets], dim=1)
 
-                    real_validity = discriminator(real_inputs)
-                    fake_validity = discriminator(fake_inputs)
+                real_validity = discriminator(real_inputs)
+                fake_validity = discriminator(fake_inputs)
 
-                    # Wasserstein loss
-                    d_loss = torch.mean(fake_validity) - torch.mean(real_validity)
+                # Wasserstein loss
+                d_loss = torch.mean(fake_validity) - torch.mean(real_validity)
 
-                    # Gradient penalty
-                    gradient_penalty = discriminator.gradient_penalty(real_inputs, fake_inputs, device)
-                    d_loss += config['lambda_gp'] * gradient_penalty
+            # Gradient penalty
+            # Gradient penalty (outside of autocast context)
+            gp = gradient_penalty(discriminator, real_inputs.float(), fake_inputs.float(), device)
+            d_loss += config['lambda_gp'] * gp
 
             scaler.scale(d_loss).backward()
             if (batch_idx + 1) % accumulation_steps == 0:
@@ -347,15 +350,15 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G
         # -----------------
         optimizer_G.zero_grad()
 
-        with autocast(enabled=torch.cuda.is_available()):
+        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
             fake_targets = generator(inputs)
             fake_inputs = torch.cat([inputs, fake_targets], dim=1)
             fake_validity = discriminator(fake_inputs)
 
             g_adv_loss = -torch.mean(fake_validity)  # Wasserstein loss for generator
-            g_l1_loss = l1_loss(fake_targets, targets)
-            g_perc_loss = perceptual_loss(fake_targets.repeat(1, 3, 1, 1), targets.repeat(1, 3, 1, 1))
-            g_ssim_loss = 1 - ssim_loss(fake_targets, targets)
+            g_l1_loss = l1_loss(fake_targets.float(), targets.float())
+            g_perc_loss = perceptual_loss(fake_targets.float(), targets.float())
+            g_ssim_loss = 1 - ssim_loss(fake_targets.float(), targets.float())
 
             # Total generator loss
             g_loss = (
@@ -370,8 +373,7 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G
             scaler.step(optimizer_G)
             scaler.update()
 
-        # Logging
-        # Accumulate losses
+        # Logging, Accumulate losses
         running_g_loss += g_loss.item()
         running_g_adv_loss += g_adv_loss.item()
         running_g_l1_loss += g_l1_loss.item()
@@ -382,10 +384,13 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G
         with torch.no_grad():
             mse_loss = nn.MSELoss()(fake_targets, targets)
             psnr = 10 * torch.log10(4 / (mse_loss + 1e-8))
-            ssim_value = ssim(fake_targets, targets, data_range=2.0, size_average=True)
+            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=False):
+                ssim_value = ssim(fake_targets.float(), targets.float(), data_range=2.0, size_average=True)
 
-        running_psnr += psnr.item()
-        running_ssim += ssim_value.item()
+        if not torch.isnan(psnr) and not torch.isinf(psnr):
+            running_psnr += psnr.item()
+        if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
+            running_ssim += ssim_value.item()
 
         if batch_idx % 100 == 0:
             visualize_batch(inputs, targets, fake_targets, epoch, batch_idx, writer)
@@ -418,12 +423,13 @@ def validate(generator, val_loader, criterion_G, device, epoch, writer, config):
         for batch_idx, (inputs, targets, indices) in enumerate(val_loader):
             inputs, targets = inputs.to(device), targets.to(device)
 
-            with autocast(enabled=torch.cuda.is_available()):
+            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
+                          enabled=torch.cuda.is_available()):
                 fake_targets = generator(inputs)
 
                 # Calculate individual losses
                 g_l1_loss = l1_loss(fake_targets.float(), targets.float())
-                g_perc_loss = perceptual_loss(fake_targets.repeat(1, 3, 1, 1), targets.repeat(1, 3, 1, 1))
+                g_perc_loss = perceptual_loss(fake_targets.float(), targets.float())
                 g_ssim_loss = 1 - ssim_loss(fake_targets.float(), targets.float())
 
                 # Total loss
@@ -439,7 +445,8 @@ def validate(generator, val_loader, criterion_G, device, epoch, writer, config):
             psnr = 10 * torch.log10(4 / (mse_loss + 1e-8))
 
             # Calculate SSIM
-            ssim_value = 1 - g_ssim_loss  # We're using 1 - ssim_loss, so we need to invert it back
+            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=False):
+                ssim_value = 1 - g_ssim_loss  # We're using 1 - ssim_loss, so we need to invert it back
 
             if not torch.isnan(psnr) and not torch.isinf(psnr):
                 val_psnr += psnr.item()
@@ -515,13 +522,15 @@ def evaluate_on_train_data(generator, train_loader_eval, device, epoch, writer):
         for batch_idx, (inputs, targets, indices) in enumerate(train_loader_eval):
             inputs, targets = inputs.to(device), targets.to(device)
 
-            with autocast(enabled=torch.cuda.is_available()):
+            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
+                          enabled=torch.cuda.is_available()):
                 fake_targets = generator(inputs)
 
                 # Calculate PSNR and SSIM
                 mse_loss = nn.MSELoss()(fake_targets.float(), targets.float())
                 psnr = 10 * torch.log10(4 / (mse_loss + 1e-8))
-                ssim_value = ssim(fake_targets.float(), targets.float(), data_range=2.0, size_average=True)
+                with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=False):
+                    ssim_value = ssim(fake_targets.float(), targets.float(), data_range=2.0, size_average=True)
 
             if not torch.isnan(psnr) and not torch.isinf(psnr):
                 train_psnr += psnr.item()
@@ -598,7 +607,9 @@ def main():
     scaler = GradScaler()
 
     # Initialize models
-    generator = EnhancedGeneratorUNet(in_channels=3, out_channels=1, features=32).to(device)
+    generator = EnhancedGeneratorUNet(
+        in_channels=3, out_channels=1, features=128, downsample_factor=8
+    ).to(device)
     discriminator = PatchGANDiscriminator(in_channels=4).to(device)
 
     # Loss functions

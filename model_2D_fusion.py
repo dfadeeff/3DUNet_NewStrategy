@@ -8,19 +8,25 @@ from pytorch_msssim import SSIM
 
 
 class InputFusionModule(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, downsample_factor=8):
         super(InputFusionModule, self).__init__()
         self.conv = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
+        self.downsample = nn.MaxPool2d(kernel_size=downsample_factor, stride=downsample_factor)
         self.attention = nn.MultiheadAttention(embed_dim=64, num_heads=8)
         self.fusion_conv = nn.Conv2d(64, 64, kernel_size=1)
+        self.upsample = nn.Upsample(scale_factor=downsample_factor, mode='bilinear', align_corners=False)
 
     def forward(self, x):
         x = self.conv(x)
         b, c, h, w = x.size()
-        x = x.view(b, c, -1).permute(2, 0, 1)
-        attended, _ = self.attention(x, x, x)
-        attended = attended.permute(1, 2, 0).view(b, c, h, w)
-        return self.fusion_conv(attended)
+        x_down = self.downsample(x)  # Shape: [b, c, h//downsample_factor, w//downsample_factor]
+        h_down, w_down = x_down.size(2), x_down.size(3)
+        x_flat = x_down.view(b, c, -1).permute(2, 0, 1)  # Shape: [seq_len, b, c]
+        attended, _ = self.attention(x_flat, x_flat, x_flat)
+        attended = attended.permute(1, 2, 0).view(b, c, h_down, w_down)
+        attended = self.upsample(attended)  # Shape: [b, c, h, w]
+        x = self.fusion_conv(attended)
+        return x
 
 
 class AttentionBlock(nn.Module):
@@ -49,9 +55,9 @@ class AttentionBlock(nn.Module):
 
 
 class EnhancedGeneratorUNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, features=64):
+    def __init__(self, in_channels=3, out_channels=1, features=128, downsample_factor=8):
         super(EnhancedGeneratorUNet, self).__init__()
-        self.input_fusion = InputFusionModule(in_channels)
+        self.input_fusion = InputFusionModule(in_channels, downsample_factor=downsample_factor)
         self.encoder1 = self.conv_block(64, features)
         self.pool1 = nn.MaxPool2d(2)
         self.encoder2 = self.conv_block(features, features * 2)
@@ -168,31 +174,32 @@ class WassersteinLoss(nn.Module):
 
 
 def gradient_penalty(discriminator, real_samples, fake_samples, device):
-    alpha = torch.rand(real_samples.size(0), 1, 1, 1).to(device)
+    batch_size = real_samples.size(0)
+    alpha = torch.rand(batch_size, 1, 1, 1, device=device)
+
+    # Ensure interpolates requires grad
     interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
+
+    # Compute discriminator output
     d_interpolates = discriminator(interpolates)
-    fake = torch.ones(d_interpolates.size()).to(device)
+
+    # Create gradient outputs
+    grad_outputs = torch.ones_like(d_interpolates, device=device, requires_grad=False)
+
+    # Compute gradients
     gradients = torch.autograd.grad(
         outputs=d_interpolates,
         inputs=interpolates,
-        grad_outputs=fake,
+        grad_outputs=grad_outputs,
         create_graph=True,
         retain_graph=True,
         only_inputs=True,
     )[0]
-    gradients = gradients.view(gradients.size(0), -1)
+
+    # Compute gradient penalty
+    gradients = gradients.view(batch_size, -1)
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+
     return gradient_penalty
 
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-
-if __name__ == "__main__":
-    # Usage
-    generator = EnhancedGeneratorUNet(in_channels=3, out_channels=1, features=64)
-    discriminator = PatchGANDiscriminator(in_channels=4)
-    print(f"Generator parameters: {count_parameters(generator):,}")
-    print(f"Discriminator parameters: {count_parameters(discriminator):,}")
