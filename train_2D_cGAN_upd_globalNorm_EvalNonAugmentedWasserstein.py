@@ -8,11 +8,11 @@ import torchio as tio
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_2D_cGAN_upd_globalNormWasserstein import GeneratorUNet, DiscriminatorWGANGP, PerceptualLoss, WassersteinLoss
+from model_2D_cGAN_upd_globalNormWasserstein import GeneratorUNet, DiscriminatorWGANGP, PerceptualLoss
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 import torchvision.transforms as transforms
 import random
 import scipy.ndimage as ndi
@@ -288,7 +288,7 @@ def load_checkpoint(generator, discriminator, optimizer_G, optimizer_D, filename
         return 0
 
 
-def train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G, optimizer_D, scaler, device, epoch,
+def train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G, optimizer_D, device, epoch,
                 writer, config, ssim_module):
     generator.train()
     discriminator.train()
@@ -304,100 +304,81 @@ def train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G
 
     for batch_idx, (inputs, targets, indices) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
         inputs, targets = inputs.to(device), targets.to(device)
+        batch_size = inputs.size(0)
 
         # ---------------------
         #  Train Discriminator
         # ---------------------
         for _ in range(config['n_critic']):
             optimizer_D.zero_grad()
-            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
-                          enabled=torch.cuda.is_available()):
-                fake_targets = generator(inputs).detach()
-                real_inputs = torch.cat([inputs, targets], dim=1)
-                fake_inputs = torch.cat([inputs, fake_targets], dim=1)
 
-                real_validity = discriminator(real_inputs)
-                fake_validity = discriminator(fake_inputs)
+            with torch.no_grad():
+                fake_targets = generator(inputs)
 
-                # Wasserstein loss
-                d_loss = -torch.mean(real_validity) + torch.mean(fake_validity)
+            real_inputs = torch.cat([inputs, targets], dim=1)
+            fake_inputs = torch.cat([inputs, fake_targets], dim=1)
 
-                # Gradient penalty
-                gradient_penalty = discriminator.gradient_penalty(real_inputs, fake_inputs, device)
-                d_loss += config['lambda_gp'] * gradient_penalty
+            real_validity = discriminator(real_inputs)
+            fake_validity = discriminator(fake_inputs)
 
-            scaler.scale(d_loss).backward()
-            scaler.unscale_(optimizer_D)
-            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-            scaler.step(optimizer_D)
-            scaler.update()
+            # Wasserstein loss
+            d_loss = torch.mean(fake_validity) - torch.mean(real_validity)
 
-        running_d_loss += d_loss.item()
+            # Gradient penalty
+            gradient_penalty = discriminator.gradient_penalty(real_inputs, fake_inputs, device)
+            d_loss += config['lambda_gp'] * gradient_penalty
+
+            d_loss.backward()
+            optimizer_D.step()
+
+            running_d_loss += d_loss.item()
 
         # -----------------
         #  Train Generator
         # -----------------
         optimizer_G.zero_grad()
-        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
-            fake_targets = generator(inputs)
-            fake_inputs = torch.cat([inputs, fake_targets], dim=1)
-            fake_validity = discriminator(fake_inputs)
 
-            # Adversarial loss
-            g_adv_loss = -torch.mean(fake_validity)
+        fake_targets = generator(inputs)
+        fake_inputs = torch.cat([inputs, fake_targets], dim=1)
+        fake_validity = discriminator(fake_inputs)
 
-            # L1 loss
-            g_l1_loss = nn.L1Loss()(fake_targets, targets)
+        # Adversarial loss
+        g_adv_loss = -torch.mean(fake_validity)
 
-            # Perceptual loss
-            g_perc_loss = criterion_G(fake_targets.repeat(1, 3, 1, 1), targets.repeat(1, 3, 1, 1))
+        # Other losses (L1, Perceptual, SSIM)
+        g_l1_loss = nn.L1Loss()(fake_targets, targets)
+        g_perc_loss = criterion_G(fake_targets.repeat(1, 3, 1, 1), targets.repeat(1, 3, 1, 1))
+        g_ssim_loss = 1 - ssim_module(fake_targets, targets)
 
-            # SSIM loss
-            g_ssim_loss = 1 - ssim_module(fake_targets, targets)
+        # Total generator loss
+        g_loss = (
+                config['lambda_adv'] * g_adv_loss +
+                config['lambda_l1'] * g_l1_loss +
+                config['lambda_perceptual'] * g_perc_loss +
+                config['lambda_ssim'] * g_ssim_loss
+        )
 
-            # Total generator loss
-            g_loss = (
-                    config['lambda_adv'] * g_adv_loss +
-                    config['lambda_l1'] * g_l1_loss +
-                    config['lambda_perceptual'] * g_perc_loss +
-                    config['lambda_ssim'] * g_ssim_loss
-            )
-
-        scaler.scale(g_loss).backward()
-        scaler.unscale_(optimizer_G)
-        torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-        scaler.step(optimizer_G)
-        scaler.update()
+        g_loss.backward()
+        optimizer_G.step()
 
         # Logging
         running_g_loss += g_loss.item()
-        running_g_adv_loss += (config['lambda_adv'] * g_adv_loss).item()
-        running_g_l1_loss += (config['lambda_l1'] * g_l1_loss).item()
-        running_g_perc_loss += (config['lambda_perceptual'] * g_perc_loss).item()
-        running_g_ssim_loss += (config['lambda_ssim'] * g_ssim_loss).item()
+        running_g_adv_loss += g_adv_loss.item()
+        running_g_l1_loss += g_l1_loss.item()
+        running_g_perc_loss += g_perc_loss.item()
+        running_g_ssim_loss += g_ssim_loss.item()
 
         # Calculate PSNR and SSIM
-        outputs_float = fake_targets.float()
-        targets_float = targets.float()
+        with torch.no_grad():
+            mse_loss = nn.MSELoss()(fake_targets, targets)
+            psnr = 10 * torch.log10(4 / (mse_loss + 1e-8))
+            ssim_value = ssim(fake_targets, targets, data_range=2.0, size_average=True)
 
-        mse_loss = nn.MSELoss()(outputs_float, targets_float)
-        epsilon = 1e-8  # Small value to prevent division by zero
-        psnr = 10 * torch.log10(4 / (mse_loss + epsilon))
-        ssim_value = ssim(outputs_float, targets_float, data_range=2.0, size_average=True)
-
-        if not torch.isnan(psnr) and not torch.isinf(psnr):
-            running_psnr += psnr.item()
-        if not torch.isnan(ssim_value) and not torch.isinf(ssim_value):
-            running_ssim += ssim_value.item()
+        running_psnr += psnr.item()
+        running_ssim += ssim_value.item()
 
         if batch_idx % 100 == 0:
             visualize_batch(inputs, targets, fake_targets, epoch, batch_idx, writer)
-
-        # Log gradient norms
-        g_total_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=float('inf'))
-        d_total_norm = torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=float('inf'))
-        writer.add_scalar('Gradients/Generator', g_total_norm, global_step=epoch * len(train_loader) + batch_idx)
-        writer.add_scalar('Gradients/Discriminator', d_total_norm, global_step=epoch * len(train_loader) + batch_idx)
 
     # Calculate average losses and metrics
     num_batches = len(train_loader)
@@ -466,14 +447,13 @@ def validate(generator, val_loader, criterion_G, device, epoch, writer, config, 
 
 def train(generator, discriminator, train_loader, val_loader, criterion_G, optimizer_G, optimizer_D, num_epochs, device,
           writer, config, ssim_module):
-    scaler = GradScaler(enabled=torch.cuda.is_available())
     best_val_loss = float('inf')
     patience = 30
     patience_counter = 0
 
     for epoch in range(num_epochs):
         g_loss, d_loss, train_psnr, train_ssim, epoch_g_adv_loss, epoch_g_l1_loss, epoch_g_perc_loss, epoch_g_ssim_loss = train_epoch(
-            generator, discriminator, train_loader, criterion_G, optimizer_G, optimizer_D, scaler, device, epoch,
+            generator, discriminator, train_loader, criterion_G, optimizer_G, optimizer_D, device, epoch,
             writer, config, ssim_module)
 
         val_loss, val_psnr, val_ssim = validate(generator, val_loader, criterion_G, device, epoch, writer, config,
@@ -524,9 +504,6 @@ def evaluate_on_train_data(generator, train_loader_eval, device, epoch, writer, 
             inputs, targets = inputs.to(device), targets.to(device)
             fake_targets = generator(inputs)
 
-            # Calculate losses if needed
-            # ...
-
             # Calculate PSNR and SSIM
             outputs_float = fake_targets.float()
             targets_float = targets.float()
@@ -558,10 +535,10 @@ def main():
 
     config = {
         'n_critic': 5,  # Number of critic iterations per generator iteration
-        'batch_size': 16,  # Adjust batch size according to GPU memory
+        'batch_size': 32,  # Adjust batch size according to GPU memory
         'num_epochs': 100,  # Increase number of epochs
-        'learning_rate_G': 1e-5,
-        'learning_rate_D': 1e-5,
+        'learning_rate_G': 1e-4,
+        'learning_rate_D': 1e-4,
         'slice_range': (2, 150),
         'lambda_adv': 1,
         'lambda_l1': 10,
@@ -570,7 +547,7 @@ def main():
         'lambda_gp': 1,  # Gradient penalty coefficient
     }
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -619,10 +596,10 @@ def main():
     ssim_module = SSIM(data_range=2.0, size_average=True, channel=1).to(device)
 
     # Optimizers
-    optimizer_G = optim.Adam(generator.parameters(), lr=config['learning_rate_G'], betas=(0.9, 0.999),
-                             weight_decay=1e-4)
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=config['learning_rate_D'], betas=(0.9, 0.999),
-                             weight_decay=1e-4)
+    optimizer_G = optim.Adam(generator.parameters(), lr=config['learning_rate_G'], betas=(0, 0.9),
+                             )
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=config['learning_rate_D'], betas=(0, 0.9),
+                             )
 
     writer = SummaryWriter('runs/WGAN')
 

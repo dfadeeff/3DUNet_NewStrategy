@@ -4,19 +4,6 @@ import torch.nn.functional as F
 from torchvision import models
 from torch.nn.utils import spectral_norm
 
-# New imports for Wasserstein loss
-from torch.autograd import Variable
-import functools
-
-
-# Define Wasserstein loss class
-class WassersteinLoss(nn.Module):
-    def __init__(self):
-        super(WassersteinLoss, self).__init__()
-
-    def forward(self, y_pred, y_true):
-        return torch.mean(y_true * y_pred)
-
 
 class AttentionBlock(nn.Module):
     def __init__(self, F_g, F_l, F_int):
@@ -129,50 +116,40 @@ class DiscriminatorWGANGP(nn.Module):
         super(DiscriminatorWGANGP, self).__init__()
         layers = []
         for idx, feature in enumerate(features):
-            if idx == 0:
-                layers.append(
-                    nn.Sequential(
-                        spectral_norm(nn.Conv2d(in_channels, feature, kernel_size=4, stride=2, padding=1)),
-                        nn.LeakyReLU(0.2, inplace=True)
-                    )
+            layers.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, feature, kernel_size=4, stride=2, padding=1, bias=False),
+                    nn.InstanceNorm2d(feature),
+                    nn.LeakyReLU(0.2, inplace=True)
                 )
-            else:
-                layers.append(
-                    nn.Sequential(
-                        spectral_norm(
-                            nn.Conv2d(features[idx - 1], feature, kernel_size=4, stride=2, padding=1, bias=False)),
-                        nn.InstanceNorm2d(feature),
-                        nn.LeakyReLU(0.2, inplace=True)
-                    )
-                )
-        layers.append(
-            spectral_norm(nn.Conv2d(features[-1], 1, kernel_size=4, padding=1))
-        )
+            )
+            in_channels = feature
         self.model = nn.Sequential(*layers)
+        self.final_layer = nn.Sequential(
+            nn.Conv2d(features[-1], 1, kernel_size=4, padding=1),
+            nn.AdaptiveAvgPool2d(1)
+        )
 
     def forward(self, x):
-        return self.model(x)
+        out = self.model(x)
+        return self.final_layer(out).view(-1)
 
     def gradient_penalty(self, real_data, fake_data, device):
         batch_size = real_data.size(0)
         epsilon = torch.rand(batch_size, 1, 1, 1, device=device)
         interpolates = epsilon * real_data + (1 - epsilon) * fake_data
         interpolates.requires_grad_(True)
-
-        d_interpolates = self(interpolates)
-
+        disc_interpolates = self(interpolates)
         gradients = torch.autograd.grad(
-            outputs=d_interpolates,
+            outputs=disc_interpolates,
             inputs=interpolates,
-            grad_outputs=torch.ones_like(d_interpolates, device=device),
+            grad_outputs=torch.ones_like(disc_interpolates, device=device),
             create_graph=True,
             retain_graph=True,
             only_inputs=True,
         )[0]
-
         gradients = gradients.view(batch_size, -1)
-        gradient_norm = gradients.norm(2, dim=1)
-        gradient_penalty = ((gradient_norm - 1) ** 2).mean()
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
         return gradient_penalty
 
 
@@ -184,63 +161,27 @@ class PerceptualLoss(nn.Module):
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
 
-        # Register mean and std buffers for normalization
-        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
-        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
-
     def forward(self, x, y):
-
-        # Scale images from [-1, 1] to [0, 1]
-        x = (x + 1) / 2
-        y = (y + 1) / 2
-
-        # Normalize using ImageNet statistics
-        x = (x - self.mean) / self.std
-        y = (y - self.mean) / self.std
-
         x_vgg = self.feature_extractor(x)
         y_vgg = self.feature_extractor(y)
-
-        # Compute L1 loss
         loss = F.l1_loss(x_vgg, y_vgg)
-
         return loss
 
 
-# Add parameter counting and memory estimation in test_model
 def test_model():
-    # Test the Generator and Discriminator with random inputs
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    generator = GeneratorUNet(in_channels=3, out_channels=1, features=64).to(device)
+    generator = GeneratorUNet(in_channels=3, out_channels=1, features=256).to(device)
     discriminator = DiscriminatorWGANGP(in_channels=4).to(device)
 
-    # Create random input tensors
-    x = torch.randn(1, 3, 240, 240).to(device)  # Adjust the size according to your data
+    x = torch.randn(1, 3, 240, 240).to(device)
     y = torch.randn(1, 1, 240, 240).to(device)
 
-    # Test Generator
     gen_out = generator(x)
     print(f"Generator output shape: {gen_out.shape}")
 
-    # Test Discriminator
     disc_in = torch.cat([x, y], dim=1)
     disc_out = discriminator(disc_in)
     print(f"Discriminator output shape: {disc_out.shape}")
-
-    # Count the number of parameters in the models
-    gen_params = sum(p.numel() for p in generator.parameters() if p.requires_grad)
-    disc_params = sum(p.numel() for p in discriminator.parameters() if p.requires_grad)
-    print(f"Number of trainable parameters in Generator: {gen_params}")
-    print(f"Number of trainable parameters in Discriminator: {disc_params}")
-
-    # Estimate memory usage (assuming float32)
-    gen_memory = gen_params * 4 / (1024 ** 3)  # in GB
-    disc_memory = disc_params * 4 / (1024 ** 3)  # in GB
-    total_memory = gen_memory + disc_memory
-    print(f"Estimated memory usage for Generator: {gen_memory:.4f} GB")
-    print(f"Estimated memory usage for Discriminator: {disc_memory:.4f} GB")
-    print(f"Total estimated memory usage: {total_memory:.4f} GB")
-
 
 if __name__ == "__main__":
     test_model()
