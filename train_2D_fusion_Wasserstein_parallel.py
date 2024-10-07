@@ -541,23 +541,49 @@ def evaluate_on_train_data(generator, train_loader_eval, device, epoch, writer):
     return avg_psnr, avg_ssim
 
 
+def setup_distributed():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        gpu = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        rank = int(os.environ['SLURM_PROCID'])
+        gpu = rank % torch.cuda.device_count()
+    else:
+        print('Not using distributed mode')
+        return None, None, None
+
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    torch.cuda.set_device(gpu)
+    return rank, world_size, gpu
+
+
+def load_checkpoint_distributed(model, optimizer, filename):
+    map_location = {'cuda:%d' % 0: 'cuda:%d' % dist.get_rank()}
+    checkpoint = torch.load(filename, map_location=map_location)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['epoch']
+
+
 def main():
-    # Set up distributed training
-    dist.init_process_group(backend='nccl')
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
+    rank, world_size, gpu = setup_distributed()
+    is_distributed = rank is not None
+
+    if is_distributed:
+        device = torch.device(f'cuda:{gpu}')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     torch.manual_seed(42)
     np.random.seed(42)
 
     config = {
         'n_critic': 5,
-        'batch_size': 16 * world_size,  # Scale batch size with number of GPUs
+        'batch_size': 16,
         'num_epochs': 100,
-        'learning_rate_G': 1e-4 * world_size,  # Scale learning rate with number of GPUs
-        'learning_rate_D': 1e-4 * world_size,
+        'learning_rate_G': 1e-4,
+        'learning_rate_D': 1e-4,
         'slice_range': (2, 150),
         'lambda_adv': 1,
         'lambda_l1': 10,
@@ -568,8 +594,7 @@ def main():
         'val_root_dir': '../data/brats18/val/',
     }
 
-    # Compute global normalization parameters (on rank 0 only)
-    if rank == 0:
+    if is_distributed and rank == 0:
         temp_train_dataset = BrainMRI2DDataset(config['train_root_dir'], config['slice_range'])
         global_input_min, global_input_max, global_target_min, global_target_max = \
             BrainMRI2DDataset.compute_global_normalization_params(
@@ -583,10 +608,10 @@ def main():
             'global_target_max': global_target_max,
         })
 
-    # Broadcast config to all processes
-    config = dist.broadcast_object_list(config, src=0)
+    if is_distributed:
+        dist.barrier()
+        config = dist.broadcast_object_list([config], src=0)[0]
 
-    # Create datasets
     train_dataset = BrainMRI2DDataset(
         config['train_root_dir'],
         config['slice_range'],
@@ -606,49 +631,50 @@ def main():
         global_target_max=config['global_target_max']
     )
 
-    # Create samplers for distributed training
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
+    if is_distributed:
+        train_sampler = DistributedSampler(train_dataset)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        batch_size = config['batch_size'] // world_size
+    else:
+        train_sampler = None
+        val_sampler = None
+        batch_size = config['batch_size']
 
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'] // world_size,
-                              sampler=train_sampler, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'] // world_size,
-                            sampler=val_sampler, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=4,
+                              pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=4, pin_memory=True)
 
-    # Initialize models
     generator = EnhancedGeneratorUNet(in_channels=3, out_channels=1, features=256).to(device)
     discriminator = PatchGANDiscriminator(in_channels=4).to(device)
 
-    # Wrap models with DDP
-    generator = DDP(generator, device_ids=[rank])
-    discriminator = DDP(discriminator, device_ids=[rank])
+    if is_distributed:
+        generator = DDP(generator, device_ids=[gpu])
+        discriminator = DDP(discriminator, device_ids=[gpu])
 
-    # Loss functions
     criterion_G = PerceptualLoss().to(device)
 
-    # Optimizers
     optimizer_G = optim.Adam(generator.parameters(), lr=config['learning_rate_G'], betas=(0, 0.9))
     optimizer_D = optim.Adam(discriminator.parameters(), lr=config['learning_rate_D'], betas=(0, 0.9))
 
-    # TensorBoard writer (only for rank 0)
-    writer = SummaryWriter('runs/Fusion1') if rank == 0 else None
+    writer = SummaryWriter('runs/Fusion1') if rank == 0 or not is_distributed else None
 
-    start_epoch = load_checkpoint(generator, discriminator, optimizer_G, optimizer_D)
+    start_epoch = load_checkpoint_distributed(generator, optimizer_G, "checkpoint_FusionV1.pth") if os.path.exists(
+        "checkpoint_FusionV1.pth") else 0
 
     for epoch in range(start_epoch, config['num_epochs']):
-        train_sampler.set_epoch(epoch)
-        train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G, optimizer_D,
-                    device, epoch, writer, config, rank)
+        if is_distributed:
+            train_sampler.set_epoch(epoch)
 
-        if rank == 0:
+        train_epoch(generator, discriminator, train_loader, criterion_G, optimizer_G, optimizer_D, device, epoch,
+                    writer, config, rank)
+
+        if rank == 0 or not is_distributed:
             val_loss, val_psnr, val_ssim = validate(generator, val_loader, criterion_G, device, epoch, writer, config)
             print(f"Epoch [{epoch + 1}/{config['num_epochs']}]")
             print(f"Val - Loss: {val_loss:.4f}, PSNR: {val_psnr:.2f}, SSIM: {val_ssim:.4f}")
             save_checkpoint(generator, discriminator, optimizer_G, optimizer_D, epoch, val_loss)
 
-    if rank == 0:
-        # Evaluation on unaugmented training data
+    if rank == 0 or not is_distributed:
         train_eval_dataset = BrainMRI2DDataset(
             config['train_root_dir'],
             config['slice_range'],
@@ -662,8 +688,10 @@ def main():
                                        shuffle=False, num_workers=4, pin_memory=True)
         train_eval_psnr, train_eval_ssim = evaluate_on_train_data(generator, train_eval_loader, device, epoch, writer)
 
-        torch.save(generator.module.state_dict(), 'generator_FusionV1.pth')
-        torch.save(discriminator.module.state_dict(), 'discriminator_FusionV1.pth')
+        torch.save(generator.module.state_dict() if is_distributed else generator.state_dict(),
+                   'generator_FusionV1.pth')
+        torch.save(discriminator.module.state_dict() if is_distributed else discriminator.state_dict(),
+                   'discriminator_FusionV1.pth')
 
         with open('normalization_params_FusionV1_MultiGPU.json', 'w') as f:
             json.dump({
@@ -673,9 +701,11 @@ def main():
                 'global_target_max': float(config['global_target_max'])
             }, f)
 
-        writer.close()
+        if writer:
+            writer.close()
 
-    dist.destroy_process_group()
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
