@@ -259,7 +259,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
 
 
 def save_checkpoint(generator, discriminator, optimizer_G, optimizer_D, epoch, loss,
-                    filename="checkpoint_cgan_globalNormWGAN.pth"):
+                    filename="checkpoint_WGANV2.pth"):
     torch.save({
         'epoch': epoch,
         'generator_state_dict': generator.state_dict(),
@@ -271,7 +271,7 @@ def save_checkpoint(generator, discriminator, optimizer_G, optimizer_D, epoch, l
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(generator, discriminator, optimizer_G, optimizer_D, filename="checkpoint_cgan_globalNormWGAN.pth"):
+def load_checkpoint(generator, discriminator, optimizer_G, optimizer_D, filename="checkpoint_WGANV2.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -535,7 +535,7 @@ def main():
 
     config = {
         'n_critic': 5,  # Number of critic iterations per generator iteration
-        'batch_size': 32,  # Adjust batch size according to GPU memory
+        'batch_size': 16,  # Adjust batch size according to GPU memory
         'num_epochs': 100,  # Increase number of epochs
         'learning_rate_G': 1e-4,
         'learning_rate_D': 1e-4,
@@ -547,7 +547,7 @@ def main():
         'lambda_gp': 1,  # Gradient penalty coefficient
     }
 
-    device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -601,7 +601,7 @@ def main():
     optimizer_D = optim.Adam(discriminator.parameters(), lr=config['learning_rate_D'], betas=(0, 0.9),
                              )
 
-    writer = SummaryWriter('runs/WGAN')
+    writer = SummaryWriter('runs/WGANV2')
 
     start_epoch = load_checkpoint(generator, discriminator, optimizer_G, optimizer_D)
 
