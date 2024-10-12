@@ -67,9 +67,7 @@ class UNet2D(nn.Module):
 
         # Up part of UNet
         for feature in reversed(features):
-            self.ups.append(
-                nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2)
-            )
+            self.ups.append(nn.Conv2d(feature * 2, feature, kernel_size=1))
             self.ups.append(DoubleConv(feature * 2, feature))
 
         self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
@@ -82,7 +80,8 @@ class UNet2D(nn.Module):
         ])
 
     def forward(self, x, t):
-        t = t.unsqueeze(-1)  # Add this line to ensure t is 2D
+        # Convert t to the same dtype as x
+        t = t.unsqueeze(-1).to(dtype=x.dtype)
         t = self.time_mlp(t)
 
         skip_connections = []
@@ -96,6 +95,7 @@ class UNet2D(nn.Module):
         x = self.attention(x)
 
         for idx in range(0, len(self.ups), 2):
+            x = F.interpolate(x, size=skip_connections[len(skip_connections) - 1 - idx // 2].shape[2:], mode='bilinear', align_corners=False)
             x = self.ups[idx](x)
             skip_connection = skip_connections[len(skip_connections) - 1 - idx // 2]
             concat_skip = torch.cat((skip_connection, x), dim=1)
@@ -111,6 +111,8 @@ class SynDiff2D(nn.Module):
         self.n_steps = n_steps
 
     def forward(self, x, t):
+        # Convert t to the same dtype as x
+        t = t.to(dtype=x.dtype)
         noise = torch.randn_like(x[:, :1])
         x_noisy = torch.cat([x, noise], dim=1)
         return self.unet(x_noisy, t)

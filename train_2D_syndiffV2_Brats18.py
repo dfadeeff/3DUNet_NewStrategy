@@ -1,5 +1,7 @@
+import torch.multiprocessing as mp
 import torch
 import torch.nn as nn
+from torch.utils.data.dataloader import default_collate
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -452,9 +454,21 @@ def main():
         global_target_max=global_target_max
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4,
-                              pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
+    # Ensure inputs and targets are of the correct dtype
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
 
     # Initialize enhanced SynDiff2D model
     model = SynDiff2D(
@@ -468,7 +482,7 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
-    writer = SummaryWriter('runs/syndiff')
+    writer = SummaryWriter('runs/syndiffV2_brats18')
 
     start_epoch = load_checkpoint(model, optimizer)
 
