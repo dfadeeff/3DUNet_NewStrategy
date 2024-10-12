@@ -295,10 +295,13 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
         optimizer.zero_grad()
         with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
             # Forward pass
-            noise = model(inputs, torch.tensor([epoch], device=device).float())
+            predicted_noise = model(inputs, torch.tensor([epoch], device=device).float())
 
-            # Compute loss (you may need to adjust this based on SynDiff2D's specific loss function)
-            loss = nn.MSELoss()(noise, targets - inputs[:, :1])  # Assuming noise predicts the residual
+            # Generate noise (this is now done inside the model)
+            noise = torch.randn_like(inputs[:, :1])
+
+            # Compute loss
+            loss = nn.MSELoss()(predicted_noise, noise)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -308,7 +311,7 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
 
         # Calculate PSNR and SSIM
         with torch.no_grad():
-            outputs = inputs[:, :1] + noise  # Reconstruct the output
+            outputs = inputs[:, :1] - predicted_noise  # Reconstruct the output
             mse_loss = nn.MSELoss()(outputs, targets)
             psnr = 10 * torch.log10(4 / mse_loss)  # Assuming data range is [-1, 1]
             ssim_value = ssim(outputs, targets, data_range=2.0, size_average=True)
@@ -338,11 +341,12 @@ def validate(model, val_loader, device, epoch, writer):
         for batch_idx, (inputs, targets, _) in enumerate(val_loader):
             inputs, targets = inputs.to(device), targets.to(device)
 
-            noise = model(inputs, torch.tensor([epoch], device=device).float())
-            outputs = inputs[:, :1] + noise  # Reconstruct the output
+            predicted_noise = model(inputs, torch.tensor([epoch], device=device).float())
+            noise = torch.randn_like(inputs[:, :1])
+            outputs = inputs[:, :1] - predicted_noise  # Reconstruct the output
 
             # Compute loss
-            loss = nn.MSELoss()(outputs, targets)
+            loss = nn.MSELoss()(predicted_noise, noise)
             val_loss += loss.item()
 
             # Calculate PSNR and SSIM
@@ -411,7 +415,7 @@ def main():
         'n_steps': 1000,  # Number of diffusion steps
     }
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'

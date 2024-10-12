@@ -106,23 +106,27 @@ class SynDiff2D(nn.Module):
         self.n_steps = n_steps
 
     def forward(self, x, t):
-        return self.unet(x, t)
+        # Generate noise
+        noise = torch.randn_like(x[:, :1])
+        # Concatenate input and noise
+        x_noisy = torch.cat([x, noise], dim=1)
+        return self.unet(x_noisy, t)
 
     @torch.no_grad()
     def fast_sampling(self, x, num_inference_steps=50):
         self.eval()
         step_size = self.n_steps // num_inference_steps
         timesteps = torch.linspace(self.n_steps - 1, 0, num_inference_steps, dtype=torch.long, device=x.device)
-        sample = torch.randn_like(x[:, :1])  # Only generate one channel (T2)
+        sample = torch.randn_like(x[:, :1])  # Only generate one channel (T1)
 
         for t in timesteps:
             x_input = torch.cat([x, sample], dim=1)
-            noise = self.forward(x_input, t.float().unsqueeze(0))
+            predicted_noise = self.forward(x, t.float().unsqueeze(0))  # Use x instead of x_input
             alpha = self.alpha_schedule(t)
             alpha_prev = self.alpha_schedule(t - step_size) if t > 0 else torch.tensor(1.0, device=x.device)
             sigma = ((1 - alpha_prev) / (1 - alpha) * (1 - alpha / alpha_prev)).sqrt()
             c = (1 - alpha_prev - sigma ** 2).sqrt()
-            sample = (sample - c * noise) / alpha_prev.sqrt()
+            sample = (sample - c * predicted_noise) / alpha_prev.sqrt()
             sample = sample + sigma * torch.randn_like(sample)
 
         self.train()
@@ -139,9 +143,9 @@ def test_model():
     syndiff = SynDiff2D(in_channels=3, out_channels=1).to(device)
     x = torch.randn(1, 3, 240, 240).to(device)
     with torch.no_grad():
-        generated_t2 = syndiff.fast_sampling(x, num_inference_steps=50)
+        generated_t1 = syndiff.fast_sampling(x, num_inference_steps=50)
     print(f"Input shape: {x.shape}")
-    print(f"Generated T2 shape: {generated_t2.shape}")
+    print(f"Generated T1 shape: {generated_t1.shape}")
     return syndiff
 
 
