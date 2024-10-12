@@ -3,112 +3,115 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ResidualBlock2D(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(ResidualBlock2D, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+class AttentionBlock(nn.Module):
+    def __init__(self, channels):
+        super(AttentionBlock, self).__init__()
+        self.channels = channels
+        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
+        self.ln = nn.LayerNorm([channels])
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm([channels]),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
 
     def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        if self.downsample:
-            residual = self.downsample(x)
-        out += residual
-        return self.relu(out)
+        size = x.shape[-1]
+        x = x.view(-1, self.channels, size * size).swapaxes(1, 2)
+        x_ln = self.ln(x)
+        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        attention_value = attention_value + x
+        attention_value = self.ff_self(attention_value) + attention_value
+        return attention_value.swapaxes(2, 1).view(-1, self.channels, size, size)
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DoubleConv, self).__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
 
 
 class UNet2D(nn.Module):
-    def __init__(self, in_channels, out_channels, time_dim):
+    def __init__(self, in_channels, out_channels, time_dim, features=[64, 128, 256, 512]):
         super(UNet2D, self).__init__()
         self.time_dim = time_dim
-        features = [64, 128, 256, 512]
 
-        # Time embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(1, time_dim),
             nn.GELU(),
-            nn.Linear(time_dim, time_dim)
+            nn.Linear(time_dim, time_dim * 4),
+            nn.GELU(),
+            nn.Linear(time_dim * 4, time_dim)
         )
 
-        # Initial projection
-        self.conv0 = nn.Conv2d(in_channels, features[0], 3, padding=1)
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # Downsample
-        self.downs = nn.ModuleList([
-            nn.ModuleList([
-                ResidualBlock2D(features[i], features[i + 1]),
-                nn.Conv2d(features[i + 1], features[i + 1], 3, stride=2, padding=1)
-            ]) for i in range(len(features) - 1)
-        ])
+        # Down part of UNet
+        in_features = in_channels
+        for feature in features:
+            self.downs.append(DoubleConv(in_features, feature))
+            in_features = feature
 
-        # Bottleneck
-        self.bottleneck = ResidualBlock2D(features[-1], features[-1])
+        # Up part of UNet
+        for feature in reversed(features):
+            self.ups.append(
+                nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2)
+            )
+            self.ups.append(DoubleConv(feature * 2, feature))
 
-        # Upsample
-        self.ups = nn.ModuleList([
-            nn.ModuleList([
-                nn.ConvTranspose2d(features[i + 1], features[i], 2, 2),
-                ResidualBlock2D(features[i] * 2, features[i])
-            ]) for i in reversed(range(len(features) - 1))
-        ])
+        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
+        self.attention = AttentionBlock(features[-1] * 2)
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
 
-        self.output = nn.Conv2d(features[0], out_channels, 1)
-
-        # Time dimension projections for down path
-        self.time_projections_down = nn.ModuleList([
-            nn.Linear(time_dim, features[i + 1]) for i in range(len(features) - 1)
-        ])
-
-        # Time dimension projections for up path
-        self.time_projections_up = nn.ModuleList([
-            nn.Linear(time_dim, features[i]) for i in reversed(range(len(features) - 1))
+        # Time dimension projections
+        self.time_projections = nn.ModuleList([
+            nn.Linear(time_dim, feature) for feature in features
         ])
 
     def forward(self, x, t):
-        # Time embedding
-        t = self.time_mlp(t.unsqueeze(-1))
+        t = t.unsqueeze(-1)  # Add this line to ensure t is 2D
+        t = self.time_mlp(t)
 
-        # Initial conv
-        x = self.conv0(x)
-
-        # Downsample
-        residuals = []
-        for i, down in enumerate(self.downs):
-            residuals.append(x)  # Store residual before residual block
-            x = down[0](x)  # ResidualBlock2D
-            x = down[1](x)  # Downsample
-            time_emb = self.time_projections_down[i](t)
-            x = x + time_emb.unsqueeze(-1).unsqueeze(-1)
+        skip_connections = []
+        for idx, down in enumerate(self.downs):
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+            x = x + self.time_projections[idx](t).unsqueeze(-1).unsqueeze(-1)
 
         x = self.bottleneck(x)
+        x = self.attention(x)
 
-        # Upsample
-        for i, (up, residual) in enumerate(zip(self.ups, reversed(residuals))):
-            x = up[0](x)  # Upsample
-            x = torch.cat((x, residual), dim=1)  # Concatenate with residual
-            x = up[1](x)  # ResidualBlock2D
-            time_emb = self.time_projections_up[i](t)
-            x = x + time_emb.unsqueeze(-1).unsqueeze(-1)
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)
+            skip_connection = skip_connections[len(skip_connections) - 1 - idx // 2]
+            concat_skip = torch.cat((skip_connection, x), dim=1)
+            x = self.ups[idx + 1](concat_skip)
 
-        return self.output(x)
+        return self.final_conv(x)
 
 
 class SynDiff2D(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, time_dim=256, n_steps=1000):
+    def __init__(self, in_channels=3, out_channels=1, time_dim=256, n_steps=1000, features=[64, 128, 256, 512]):
         super(SynDiff2D, self).__init__()
-        self.unet = UNet2D(in_channels + 1, out_channels, time_dim)  # +1 for noise channel
+        self.unet = UNet2D(in_channels + 1, out_channels, time_dim, features=features)
         self.n_steps = n_steps
 
     def forward(self, x, t):
-        # Generate noise
         noise = torch.randn_like(x[:, :1])
-        # Concatenate input and noise
         x_noisy = torch.cat([x, noise], dim=1)
         return self.unet(x_noisy, t)
 
