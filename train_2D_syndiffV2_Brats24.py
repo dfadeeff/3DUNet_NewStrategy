@@ -91,13 +91,13 @@ class BrainMRI2DDataset(Dataset):
                 for filename in os.listdir(subject_path):
                     if filename.startswith('.') or filename.startswith('._'):
                         continue
-                    if filename.endswith('flair.nii'):
+                    if filename.endswith('t2f.nii.gz'):
                         data_entry['FLAIR'] = os.path.join(subject_path, filename)
-                    elif filename.endswith('t1.nii'):
+                    elif filename.endswith('t1n.nii.gz'):
                         data_entry['T1'] = os.path.join(subject_path, filename)
-                    elif filename.endswith('t1ce.nii'):
+                    elif filename.endswith('t1c.nii.gz'):
                         data_entry['T1c'] = os.path.join(subject_path, filename)
-                    elif filename.endswith('t2.nii'):
+                    elif filename.endswith('t2w.nii.gz'):
                         data_entry['T2'] = os.path.join(subject_path, filename)
 
                 if all(data_entry.values()):
@@ -260,7 +260,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_syndiffV2_brats18.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_syndiffV2_brats24.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -270,7 +270,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_syndiffV
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV2_brats18.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV2_brats24.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -422,8 +422,10 @@ def main():
     device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_root_dir = '../data/brats18/train/combined/'
-    val_root_dir = '../data/brats18/val/'
+    # train_root_dir = '../data/brats18/train/combined/'
+    # val_root_dir = '../data/brats18/val/'
+    train_root_dir = '../data/brats24/train/training_data1_v2/'
+    val_root_dir = '../data/brats24/val/validation_data/'
 
     # Initialize a temporary training dataset to compute normalization parameters
     temp_train_dataset = BrainMRI2DDataset(train_root_dir, config['slice_range'])
@@ -482,7 +484,7 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
-    writer = SummaryWriter('runs/syndiffV2_brats18')
+    writer = SummaryWriter('runs/syndiffV2_brats24')
 
     start_epoch = load_checkpoint(model, optimizer)
 
@@ -491,9 +493,9 @@ def main():
     # Step the scheduler after each epoch
     scheduler.step()
 
-    torch.save(model.state_dict(), 'syndiff_modelV2_brats18.pth')
+    torch.save(model.state_dict(), 'syndiff_modelV2_brats24.pth')
 
-    with open('patient_normalization_params_syndiffV2_brats18.json', 'w') as f:
+    with open('patient_normalization_params_syndiffV2_brats24.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
