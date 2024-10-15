@@ -10,7 +10,7 @@ import torchio as tio
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_2D_syndiffV2 import SynDiff2D
+from model_2D_syndiffV2_Brats18 import SynDiff2D
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
