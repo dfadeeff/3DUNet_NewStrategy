@@ -1,173 +1,286 @@
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+def get_timestep_embedding(timesteps, embedding_dim):
+    """
+    Create sinusoidal timestep embeddings.
+    """
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -emb)
+    emb = timesteps[:, None].float() * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:  # Zero pad
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+
+class ResidualBlock(nn.Module):
+    """
+    A residual block that can condition on time embeddings.
+    """
+    def __init__(self, in_channels, out_channels, time_emb_dim, dropout=0.0):
+        super(ResidualBlock, self).__init__()
+        self.norm1 = nn.BatchNorm2d(in_channels)
+        self.activation = nn.SiLU()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+
+        self.time_emb_proj = nn.Linear(time_emb_dim, out_channels)
+
+        self.norm2 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+        self.use_shortcut = in_channels != out_channels
+        if self.use_shortcut:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, t_emb):
+        h = self.conv1(self.activation(self.norm1(x)))
+        # Add time embedding
+        h = h + self.time_emb_proj(t_emb)[:, :, None, None]
+        h = self.conv2(self.activation(self.norm2(h)))
+        h = self.dropout(h)
+        if self.use_shortcut:
+            x = self.shortcut(x)
+        return x + h
+
+
 class AttentionBlock(nn.Module):
+    """
+    An attention block that allows spatial positions to attend to each other.
+    """
     def __init__(self, channels):
         super(AttentionBlock, self).__init__()
-        self.channels = channels
-        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
-        self.ln = nn.LayerNorm([channels])
-        self.ff_self = nn.Sequential(
-            nn.LayerNorm([channels]),
-            nn.Linear(channels, channels),
-            nn.GELU(),
-            nn.Linear(channels, channels),
-        )
+        self.norm = nn.GroupNorm(32, channels)
+        self.qkv = nn.Conv1d(channels, channels * 3, kernel_size=1)
+        self.proj_out = nn.Conv1d(channels, channels, kernel_size=1)
 
     def forward(self, x):
-        size = x.shape[-1]
-        x = x.view(-1, self.channels, size * size).swapaxes(1, 2)
-        x_ln = self.ln(x)
-        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
-        attention_value = attention_value + x
-        attention_value = self.ff_self(attention_value) + attention_value
-        return attention_value.swapaxes(2, 1).view(-1, self.channels, size, size)
+        # x: (batch, channels, height, width)
+        batch, channels, height, width = x.shape
+        x_in = x
+        x = x.view(batch, channels, height * width)
+        x = self.norm(x)
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=1)
+
+        scale = 1 / math.sqrt(math.sqrt(channels))
+        weight = torch.einsum(
+            "bct,bcs->bts", (q * scale, k * scale)
+        )  # (batch, tokens, tokens)
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+
+        a = torch.einsum("bts,bcs->bct", (weight, v))
+        h = self.proj_out(a)
+        h = h.view(batch, channels, height, width)
+        return x_in + h
 
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DoubleConv, self).__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(32, out_channels),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(32, out_channels),
-            nn.GELU(),
+class TimeSequential(nn.Sequential):
+    def forward(self, x, t_emb):
+        for layer in self:
+            if isinstance(layer, ResidualBlock):
+                x = layer(x, t_emb)
+            else:
+                x = layer(x)
+        return x
+
+
+class UNetModel(nn.Module):
+    """
+    The UNet model with attention and time embeddings.
+    """
+    def __init__(self, in_channels, out_channels, time_emb_dim, num_channels, channel_mults, num_res_blocks=2, attention_resolutions=[16], dropout=0.0):
+        super(UNetModel, self).__init__()
+        self.in_channels = in_channels
+        self.time_emb_dim = time_emb_dim
+
+        self.time_embedding = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim),
         )
 
-    def forward(self, x):
-        return self.double_conv(x)
+        self.input_blocks = nn.ModuleList()
+        self.input_blocks.append(TimeSequential(
+            nn.Conv2d(in_channels, num_channels, kernel_size=3, padding=1)
+        ))
+        input_block_chans = [num_channels]
+        ch = num_channels
+        ds = 1  # Downsample factor
 
+        for level, mult in enumerate(channel_mults):
+            for _ in range(num_res_blocks):
+                layers = [
+                    ResidualBlock(ch, mult * num_channels, time_emb_dim, dropout=dropout)
+                ]
+                ch = mult * num_channels
+                if ds in attention_resolutions:
+                    layers.append(AttentionBlock(ch))
+                self.input_blocks.append(TimeSequential(*layers))
+                input_block_chans.append(ch)
+            if level != len(channel_mults) - 1:
+                self.input_blocks.append(TimeSequential(
+                    ResidualBlock(ch, ch, time_emb_dim, dropout=dropout),
+                    nn.Conv2d(ch, ch, kernel_size=3, stride=2, padding=1)
+                ))
+                input_block_chans.append(ch)
+                ds *= 2
 
-class UNet2D(nn.Module):
-    def __init__(self, in_channels, out_channels, time_dim, features=[64, 128, 256, 512]):
-        super(UNet2D, self).__init__()
-        self.time_dim = time_dim
-
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, time_dim),
-            nn.GELU(),
-            nn.Linear(time_dim, time_dim * 4),
-            nn.GELU(),
-            nn.Linear(time_dim * 4, time_dim)
+        self.middle_block = TimeSequential(
+            ResidualBlock(ch, ch, time_emb_dim, dropout=dropout),
+            AttentionBlock(ch),
+            ResidualBlock(ch, ch, time_emb_dim, dropout=dropout),
         )
 
-        self.downs = nn.ModuleList()
-        self.ups = nn.ModuleList()
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.output_blocks = nn.ModuleList()
+        for level, mult in list(enumerate(channel_mults))[::-1]:
+            for i in range(num_res_blocks + 1):
+                layers = [
+                    ResidualBlock(ch + input_block_chans.pop(), mult * num_channels, time_emb_dim, dropout=dropout)
+                ]
+                ch = mult * num_channels
+                if ds in attention_resolutions:
+                    layers.append(AttentionBlock(ch))
+                if level and i == num_res_blocks:
+                    layers.append(nn.ConvTranspose2d(ch, ch, kernel_size=4, stride=2, padding=1))
+                    ds //= 2
+                self.output_blocks.append(TimeSequential(*layers))
 
-        # Down part of UNet
-        in_features = in_channels
-        for feature in features:
-            self.downs.append(DoubleConv(in_features, feature))
-            in_features = feature
-
-        # Up part of UNet
-        for feature in reversed(features):
-            self.ups.append(nn.Conv2d(feature * 2, feature, kernel_size=1))
-            self.ups.append(DoubleConv(feature * 2, feature))
-
-        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
-        self.attention = AttentionBlock(features[-1] * 2)
-        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
-
-        # Time dimension projections
-        self.time_projections = nn.ModuleList([
-            nn.Linear(time_dim, feature) for feature in features
-        ])
+        self.out = nn.Sequential(
+            nn.GroupNorm(32, ch),
+            nn.SiLU(),
+            nn.Conv2d(ch, out_channels, kernel_size=3, padding=1),
+        )
 
     def forward(self, x, t):
-        # x is concatenation of x_t and x_cond
-        # Convert t to the same dtype as x
-        t = t.unsqueeze(-1).to(dtype=x.dtype)
-        t = self.time_mlp(t)
+        t_emb = get_timestep_embedding(t, self.time_emb_dim)
+        t_emb = self.time_embedding(t_emb)
 
-        skip_connections = []
-        for idx, down in enumerate(self.downs):
-            x = down(x)
-            skip_connections.append(x)
-            x = self.pool(x)
-            time_proj = self.time_projections[idx](t).unsqueeze(-1).unsqueeze(-1)
-            x = x + time_proj
+        hs = []
+        for module in self.input_blocks:
+            x = module(x, t_emb)
+            hs.append(x)
 
-        x = self.bottleneck(x)
-        x = self.attention(x)
+        x = self.middle_block(x, t_emb)
 
-        for idx in range(0, len(self.ups), 2):
-            x = F.interpolate(x, size=skip_connections[len(skip_connections) - 1 - idx // 2].shape[2:], mode='bilinear',
-                              align_corners=False)
-            x = self.ups[idx](x)
-            skip_connection = skip_connections[len(skip_connections) - 1 - idx // 2]
-            concat_skip = torch.cat((skip_connection, x), dim=1)
-            x = self.ups[idx + 1](concat_skip)
+        for module in self.output_blocks:
+            x = torch.cat([x, hs.pop()], dim=1)
+            x = module(x, t_emb)
 
-        return self.final_conv(x)
+        return self.out(x)
 
 
-class CoLADiff2D(nn.Module):
-    def __init__(self, in_channels=4, out_channels=1, time_dim=256, n_steps=1000, features=[64, 128, 256, 512]):
-        super(CoLADiff2D, self).__init__()
-        self.unet = UNet2D(in_channels, out_channels, time_dim, features=features)
+class CoLADiffusionModel(nn.Module):
+    """
+    The complete CoLA-Diffusion model with noise schedule and sampling.
+    """
+    def __init__(self, in_channels=4, out_channels=1, num_channels=128, channel_mults=(1, 2, 2, 4), num_res_blocks=2, attention_resolutions=[16], dropout=0.0, n_steps=1000):
+        super(CoLADiffusionModel, self).__init__()
         self.n_steps = n_steps
+
+        # Define beta schedule
+        betas = self.cosine_beta_schedule(n_steps)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        # Register buffers
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
+
+        self.unet = UNetModel(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            time_emb_dim= num_channels * 4,
+            num_channels=num_channels,
+            channel_mults=channel_mults,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions,
+            dropout=dropout,
+        )
+
+    def cosine_beta_schedule(self, timesteps, s=0.008):
+        """
+        Cosine schedule as proposed in the official code.
+        """
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
+        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi / 2) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clip(betas, 0.0001, 0.9999).float()
 
     def forward(self, x_t, x_cond, t):
         # x_t: noisy target image (T2)
         # x_cond: conditioning images (T1, T1c, FLAIR)
-        x = torch.cat([x_t, x_cond], dim=1)
+        x = torch.cat([x_t, x_cond], dim=1)  # Concatenate along channel dimension
         return self.unet(x, t)
 
+
+
     @torch.no_grad()
-    def sample(self, x_cond, num_inference_steps=50):
+    def ddim_sample(self, x_cond, num_inference_steps=50, eta=0.0):
+        """
+        DDIM sampling function.
+        """
         self.eval()
         batch_size = x_cond.size(0)
         device = x_cond.device
-        step_size = self.n_steps // num_inference_steps
-        timesteps = torch.arange(self.n_steps - 1, -1, -step_size, device=device).long()
+
+        # Create a list of timesteps for sampling
+        timesteps = torch.linspace(self.n_steps - 1, 0, num_inference_steps, device=device).long()
 
         sample = torch.randn(batch_size, 1, x_cond.shape[2], x_cond.shape[3], device=device)
 
-        for idx, t in enumerate(timesteps):
-            t_tensor = torch.tensor([t], dtype=torch.float32, device=device).repeat(batch_size)
-            alpha_t = self.alpha_schedule(t)
-            beta_t = 1 - alpha_t
+        for i, t in enumerate(timesteps):
+            t_int = t.long()
+            t_tensor = torch.full((batch_size,), t_int, device=device, dtype=torch.long)
 
-            predicted_noise = self.forward(sample, x_cond, t_tensor)
+            # Get alpha and beta values
+            alpha_t = self.alphas_cumprod[t_int].view(-1, 1, 1, 1)
+            alpha_prev = self.alphas_cumprod[timesteps[i + 1].long()].view(-1, 1, 1,
+                                                                           1) if i < num_inference_steps - 1 else \
+            self.alphas_cumprod[0].view(-1, 1, 1, 1)
+            beta_t = self.betas[t_int].view(-1, 1, 1, 1)
 
-            if idx < len(timesteps) - 1:
-                alpha_next = self.alpha_schedule(timesteps[idx + 1])
-                beta_next = 1 - alpha_next
-                sample = (1 / alpha_t.sqrt()) * (sample - beta_t / (1 - alpha_t).sqrt() * predicted_noise)
-                noise = torch.randn_like(sample)
-                sample += beta_next.sqrt() * noise
-            else:
-                # Last step
-                sample = (1 / alpha_t.sqrt()) * (sample - beta_t / (1 - alpha_t).sqrt() * predicted_noise)
+            # Predict noise
+            predicted_noise = self.forward(sample, x_cond, t_tensor.float())
+
+            # Compute the current x0 estimate
+            sample_x0 = (sample - self.sqrt_one_minus_alphas_cumprod[t_int].view(-1, 1, 1, 1) * predicted_noise) / \
+                        self.sqrt_alphas_cumprod[t_int].view(-1, 1, 1, 1)
+
+            # Compute direction pointing to x_t
+            dir_xt = torch.sqrt(1.0 - alpha_prev - eta * beta_t) * predicted_noise
+
+            # Update sample
+            sample = torch.sqrt(alpha_prev) * sample_x0 + dir_xt
 
         self.train()
         return sample
 
-    def alpha_schedule(self, t):
-        t = t.float()
-        return torch.cos(((t / self.n_steps + 0.008) / 1.008) * (math.pi / 2)) ** 2
-
 
 def test_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    coladiff = CoLADiff2D(in_channels=4, out_channels=1).to(device)
+    coladiff = CoLADiffusionModel(in_channels=4, out_channels=1).to(device)
+
     # Simulate 3D input data
-    num_slices = 155
-    x_cond_3d = torch.randn(1, 3, num_slices, 240, 240).to(device)  # T1, T1c, FLAIR
-    x_t_3d = torch.randn(1, 1, num_slices, 240, 240).to(device)  # Noisy T2
+    num_slices = 10  # Reduced from 155 to 10 to save memory
+    x_cond_3d = torch.randn(1, 3, num_slices, 240, 240).to(device)  # Reduced image size to 128x128
+    x_t_3d = torch.randn(1, 1, num_slices, 240, 240).to(device)
 
     # Reshape to batch of 2D slices
-    x_cond = x_cond_3d.squeeze(0).permute(1, 0, 2, 3)  # Shape: (3, num_slices, 240, 240) -> (num_slices, 3, 240, 240)
-    x_t = x_t_3d.squeeze(0).permute(1, 0, 2, 3)  # Shape: (1, num_slices, 240, 240) -> (num_slices, 1, 240, 240)
-    t = torch.tensor([500], dtype=torch.float32).repeat(num_slices).to(device)  # Time steps for each slice
+    x_cond = x_cond_3d.squeeze(0).permute(1, 0, 2, 3)
+    x_t = x_t_3d.squeeze(0).permute(1, 0, 2, 3)
+
+    t = torch.tensor([500], dtype=torch.float32).repeat(num_slices).to(device)
 
     # Forward pass
     predicted_noise = coladiff(x_t, x_cond, t)
@@ -175,17 +288,16 @@ def test_model():
     print(f"Input x_t shape: {x_t.shape}")
     print(f"Predicted noise shape: {predicted_noise.shape}")
 
-    # Sampling
+    # Sampling using DDIM
     with torch.no_grad():
-        generated_t2 = coladiff.sample(x_cond, num_inference_steps=50)
+        generated_t2 = coladiff.ddim_sample(x_cond, num_inference_steps=20, eta=0.0)
     print(f"Generated T2 shape: {generated_t2.shape}")
 
     # Reshape generated T2 to 3D volume
-    generated_t2_3d = generated_t2.squeeze(1).unsqueeze(0)  # Shape: (num_slices, 240, 240) -> (1, num_slices, 240, 240)
+    generated_t2_3d = generated_t2.squeeze(1).unsqueeze(0)
     print(f"Generated T2 3D shape: {generated_t2_3d.shape}")
     return coladiff
 
-
 if __name__ == "__main__":
     model = test_model()
-    print("CoLADiff2D test completed successfully!")
+    print("CoLADiffusionModel test completed successfully!")
