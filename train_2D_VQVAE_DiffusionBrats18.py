@@ -10,7 +10,7 @@ import torchio as tio
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_2D_CoLADiff_Brats18 import CoLADiffusionModel
+from model_2D_VQVAE_Diffusion import LatentDiffusionVQVAEUNet
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
@@ -18,6 +18,7 @@ from torch.amp import GradScaler, autocast
 import torchvision.transforms as transforms
 import random
 import scipy.ndimage as ndi
+import torch.nn.functional as F
 
 
 class ElasticTransform2D:
@@ -261,7 +262,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_coladiffV2_brats18.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_vqvae_brats18.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -271,7 +272,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_coladiff
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_coladiffV2_brats18.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_vqvae_brats18.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -298,19 +299,12 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
             # Generate random time steps
             t = torch.randint(0, config['n_steps'], (targets.size(0),), device=device).long()
 
-            # Get precomputed alpha values
-            sqrt_alphas_cumprod_t = model.sqrt_alphas_cumprod[t][:, None, None, None]
-            sqrt_one_minus_alphas_cumprod_t = model.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
-
-            # Generate noise and x_t
-            noise = torch.randn_like(targets)
-            x_t = sqrt_alphas_cumprod_t * targets + sqrt_one_minus_alphas_cumprod_t * noise
-
             # Forward pass
-            predicted_noise = model(x_t, x_cond, t.float())
+            output, vq_loss, diffusion_loss = model(x_cond, x_cond, x_cond, t)  # Pass x_cond three times for the three modalities
 
             # Compute loss
-            loss = nn.MSELoss()(predicted_noise, noise)
+            mse_loss = F.mse_loss(output, targets)
+            loss = mse_loss + vq_loss + diffusion_loss
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -333,44 +327,33 @@ def validate(model, val_loader, device, epoch, writer, config):
         for batch_idx, (x_cond, targets, _) in enumerate(tqdm(val_loader, desc="Validation")):
             x_cond, targets = x_cond.to(device), targets.to(device)
 
-            # Generate random time steps
-            t = torch.randint(0, config['n_steps'], (targets.size(0),), device=device).long()
-
-            # Get precomputed alpha values
-            sqrt_alphas_cumprod_t = model.sqrt_alphas_cumprod[t][:, None, None, None]
-            sqrt_one_minus_alphas_cumprod_t = model.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
-
-            # Generate noise and x_t
-            noise = torch.randn_like(targets)
-            x_t = sqrt_alphas_cumprod_t * targets + sqrt_one_minus_alphas_cumprod_t * noise
-
             # Forward pass
-            predicted_noise = model(x_t, x_cond, t.float())
+            output, vq_loss, diffusion_loss = model(x_cond, x_cond, x_cond, None)  # Pass None for t during inference
 
             # Compute loss
-            loss = nn.MSELoss()(predicted_noise, noise)
+            mse_loss = F.mse_loss(output, targets)
+            loss = mse_loss + vq_loss + diffusion_loss
             val_loss += loss.item()
 
-            # Sampling to generate images
-            generated_images = model.ddim_sample(x_cond, num_inference_steps=20, eta=0.0)
-
-            # Calculate PSNR and SSIM
-            mse_loss = nn.MSELoss()(generated_images, targets)
-            psnr = 10 * torch.log10(4 / mse_loss)  # Assuming data range is [-1, 1]
-            ssim_value = ssim(generated_images, targets, data_range=2.0, size_average=True)
-
+            # Calculate PSNR
+            psnr = -10 * torch.log10(mse_loss)
             val_psnr += psnr.item()
+
+            # Calculate SSIM
+            ssim_value = ssim(output, targets, data_range=2.0, size_average=True)  # data_range is 2 for [-1, 1]
             val_ssim += ssim_value.item()
+
             num_batches += 1
 
             if batch_idx == 0:
-                visualize_batch(x_cond, targets, generated_images, epoch, batch_idx, writer)
+                visualize_batch(x_cond, targets, output, epoch, batch_idx, writer)
 
-    val_loss /= len(val_loader)
+    val_loss /= num_batches
     val_psnr /= num_batches
     val_ssim /= num_batches
 
     return val_loss, val_psnr, val_ssim
+
 
 def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, device, writer, config):
     scaler = GradScaler(enabled=torch.cuda.is_available())
@@ -403,7 +386,6 @@ def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, dev
             print(f"Early stopping triggered after {epoch + 1} epochs")
             break
 
-        # Step the scheduler after each epoch
         scheduler.step()
 
     print("Training completed successfully!")
@@ -479,23 +461,19 @@ def main():
         pin_memory=True
     )
 
-    # Initialize enhanced SynDiff2D model
-    # Initialize the CoLADiffusionModel
-    model = CoLADiffusionModel(
-        in_channels=4,  # 1 (x_t) + 3 (x_cond)
-        out_channels=1,
-        num_channels=config['num_channels'],
-        channel_mults=config['channel_mults'],
-        num_res_blocks=config['num_res_blocks'],
-        attention_resolutions=config['attention_resolutions'],
-        dropout=config['dropout'],
-        n_steps=config['n_steps']
+    model = LatentDiffusionVQVAEUNet(
+        in_channels=1,  # Each modality is passed separately
+        out_channels=1,  # T2
+        latent_dim=config['num_channels'],
+        num_embeddings=512,
+        commitment_cost=0.25,
+        num_timesteps=config['n_steps']
     ).to(device)
 
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
-    writer = SummaryWriter('runs/coladiffV2_brats18')
+    writer = SummaryWriter('runs/vqvae_brats18')
 
     start_epoch = load_checkpoint(model, optimizer)
 
@@ -511,11 +489,9 @@ def main():
         config
     )
 
+    torch.save(model.state_dict(), 'vqvae_brats18.pth')
 
-
-    torch.save(model.state_dict(), 'coladiff_model_brats18V2.pth')
-
-    with open('patient_normalization_params_coladiff_brats18V2.json', 'w') as f:
+    with open('patient_normalization_params_vqvae_brats18.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()

@@ -257,6 +257,41 @@ class LatentDiffusionVQVAEUNet(nn.Module):
         out_volume = torch.stack(output_slices, dim=2)
         return out_volume, total_vq_loss / depth, total_diffusion_loss / depth
 
+    @torch.no_grad()
+    def sample(self, x_cond):
+        batch_size = x_cond.shape[0]
+        device = x_cond.device
+
+        # Encode and fuse input modalities
+        latent1 = self.encoder(x_cond[:, 0:1])
+        latent2 = self.encoder(x_cond[:, 1:2])
+        latent3 = self.encoder(x_cond[:, 2:3])
+
+        quantized1, _, _ = self.quantizer(latent1)
+        quantized2, _, _ = self.quantizer(latent2)
+        quantized3, _, _ = self.quantizer(latent3)
+
+        quantized1 = self.self_attention(quantized1)
+        quantized2 = self.self_attention(quantized2)
+        quantized3 = self.self_attention(quantized3)
+
+        fused_latent = self.cross_attention(quantized1, quantized2)
+        fused_latent = self.cross_attention(fused_latent, quantized3)
+
+        # Sample from the diffusion model
+        x = torch.randn_like(fused_latent)
+        for i in reversed(range(self.diffusion.num_timesteps)):
+            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
+            x = self.diffusion.reverse_diffusion(x, t)
+            if i > 0:
+                noise = torch.randn_like(x)
+                x += torch.sqrt(self.diffusion.betas[i]) * noise
+
+        # Decode the sampled latent
+        out = self.decoder(x)
+
+        return out
+
 
 def test_latent_diffusion():
     model = LatentDiffusionVQVAEUNet(in_channels=3, out_channels=1)
