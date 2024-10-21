@@ -213,73 +213,39 @@ class LatentDiffusionVQVAEUNet(nn.Module):
         self.self_attention = SelfAttention(latent_dim)
         self.cross_attention = CrossAttention(latent_dim)
 
-    def forward(self, x_modality1, x_modality2, x_modality3, timesteps):
-        depth = x_modality1.shape[2]
-        output_slices = []
-        total_vq_loss = 0
-        total_diffusion_loss = 0
+    def forward(self, x_cond, timesteps):
+        # x_cond shape: (batch_size, 3, H, W)
+        latent = self.encoder(x_cond)  # Process all 3 channels together
 
-        for i in range(depth):
-            slice_modality1 = x_modality1[:, :, i, :, :]
-            slice_modality2 = x_modality2[:, :, i, :, :]
-            slice_modality3 = x_modality3[:, :, i, :, :]
+        quantized, vq_loss, _ = self.quantizer(latent)
 
-            latent1 = self.encoder(slice_modality1)
-            latent2 = self.encoder(slice_modality2)
-            latent3 = self.encoder(slice_modality3)
+        quantized = self.self_attention(quantized)
 
-            quantized1, vq_loss1, _ = self.quantizer(latent1)
-            quantized2, vq_loss2, _ = self.quantizer(latent2)
-            quantized3, vq_loss3, _ = self.quantizer(latent3)
+        # Apply diffusion process
+        diffusion_loss = self.diffusion.loss_function(quantized, timesteps)
 
-            total_vq_loss += vq_loss1 + vq_loss2 + vq_loss3
+        # For inference, use the full reverse process
+        if not self.training:
+            quantized = self.diffusion.sample(quantized.shape)
 
-            quantized1 = self.self_attention(quantized1)
-            quantized2 = self.self_attention(quantized2)
-            quantized3 = self.self_attention(quantized3)
+        out = self.decoder(quantized)
 
-            fused_latent = self.cross_attention(quantized1, quantized2)
-            fused_latent = self.cross_attention(fused_latent, quantized3)
-
-            # Apply diffusion process
-            t = torch.randint(0, self.diffusion.num_timesteps, (fused_latent.shape[0],),
-                              device=fused_latent.device).long()
-            diffusion_loss = self.diffusion.loss_function(fused_latent, t)
-            total_diffusion_loss += diffusion_loss
-
-            # For inference, use the full reverse process
-            if not self.training:
-                fused_latent = self.diffusion.sample(fused_latent.shape)
-
-            out_slice = self.decoder(fused_latent)
-            output_slices.append(out_slice)
-
-        out_volume = torch.stack(output_slices, dim=2)
-        return out_volume, total_vq_loss / depth, total_diffusion_loss / depth
+        return out, vq_loss, diffusion_loss
 
     @torch.no_grad()
     def sample(self, x_cond):
         batch_size = x_cond.shape[0]
         device = x_cond.device
 
-        # Encode and fuse input modalities
-        latent1 = self.encoder(x_cond[:, 0:1])
-        latent2 = self.encoder(x_cond[:, 1:2])
-        latent3 = self.encoder(x_cond[:, 2:3])
+        # Encode input modalities
+        latent = self.encoder(x_cond)
 
-        quantized1, _, _ = self.quantizer(latent1)
-        quantized2, _, _ = self.quantizer(latent2)
-        quantized3, _, _ = self.quantizer(latent3)
+        quantized, _, _ = self.quantizer(latent)
 
-        quantized1 = self.self_attention(quantized1)
-        quantized2 = self.self_attention(quantized2)
-        quantized3 = self.self_attention(quantized3)
-
-        fused_latent = self.cross_attention(quantized1, quantized2)
-        fused_latent = self.cross_attention(fused_latent, quantized3)
+        quantized = self.self_attention(quantized)
 
         # Sample from the diffusion model
-        x = torch.randn_like(fused_latent)
+        x = torch.randn_like(quantized)
         for i in reversed(range(self.diffusion.num_timesteps)):
             t = torch.full((batch_size,), i, device=device, dtype=torch.long)
             x = self.diffusion.reverse_diffusion(x, t)
@@ -295,13 +261,12 @@ class LatentDiffusionVQVAEUNet(nn.Module):
 
 def test_latent_diffusion():
     model = LatentDiffusionVQVAEUNet(in_channels=3, out_channels=1)
-    x_modality1 = torch.randn(1, 3, 155, 240, 240)  # Example input (T1)
-    x_modality2 = torch.randn(1, 3, 155, 240, 240)  # Example input (T1c)
-    x_modality3 = torch.randn(1, 3, 155, 240, 240)  # Example input (FLAIR)
-    timesteps = 100  # Example number of diffusion steps
+    # Create a single input tensor with all three modalities
+    x_cond = torch.randn(1, 3, 240, 240)  # Example input (T1, T1c, FLAIR)
+    timesteps = torch.randint(0, 1000, (1,))  # Example timesteps
 
     with torch.no_grad():
-        output, vq_loss, diffusion_loss = model(x_modality1, x_modality2, x_modality3, timesteps)
+        output, vq_loss, diffusion_loss = model(x_cond, timesteps)
 
     print(f"Output shape: {output.shape}")
     print(f"VQ-VAE Loss: {vq_loss.item()}")

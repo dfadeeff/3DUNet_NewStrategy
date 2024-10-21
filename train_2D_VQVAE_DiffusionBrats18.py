@@ -297,10 +297,10 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
         optimizer.zero_grad()
         with autocast():
             # Generate random time steps
-            t = torch.randint(0, config['n_steps'], (targets.size(0),), device=device).long()
+            t = torch.randint(0, config['n_steps'], (x_cond.size(0),), device=device).long()
 
             # Forward pass
-            output, vq_loss, diffusion_loss = model(x_cond, x_cond, x_cond, t)  # Pass x_cond three times for the three modalities
+            output, vq_loss, diffusion_loss = model(x_cond, t)
 
             # Compute loss
             mse_loss = F.mse_loss(output, targets)
@@ -328,7 +328,7 @@ def validate(model, val_loader, device, epoch, writer, config):
             x_cond, targets = x_cond.to(device), targets.to(device)
 
             # Forward pass
-            output, vq_loss, diffusion_loss = model(x_cond, x_cond, x_cond, None)  # Pass None for t during inference
+            output, vq_loss, diffusion_loss = model(x_cond, None)  # Pass None for t during inference
 
             # Compute loss
             mse_loss = F.mse_loss(output, targets)
@@ -462,7 +462,7 @@ def main():
     )
 
     model = LatentDiffusionVQVAEUNet(
-        in_channels=1,  # Each modality is passed separately
+        in_channels=3,  # T1, T1c, FLAIR
         out_channels=1,  # T2
         latent_dim=config['num_channels'],
         num_embeddings=512,
