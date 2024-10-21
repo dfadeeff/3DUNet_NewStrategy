@@ -158,7 +158,8 @@ class DiffusionModel(nn.Module):
         self.num_timesteps = num_timesteps
         self.betas = torch.linspace(1e-4, 0.02, num_timesteps)
         self.alphas = 1 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
 
         self.unet = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1),

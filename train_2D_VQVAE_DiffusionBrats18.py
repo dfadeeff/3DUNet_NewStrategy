@@ -295,7 +295,7 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
         x_cond, targets = x_cond.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        with autocast():
+        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
             # Generate random time steps
             t = torch.randint(0, config['n_steps'], (x_cond.size(0),), device=device).long()
 
@@ -397,7 +397,7 @@ def main():
     np.random.seed(42)
 
     config = {
-        'batch_size': 8,
+        'batch_size': 16,
         'num_epochs': 200,
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
@@ -410,7 +410,7 @@ def main():
         'dropout': 0.0
     }
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -469,6 +469,8 @@ def main():
         commitment_cost=0.25,
         num_timesteps=config['n_steps']
     ).to(device)
+
+
 
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
