@@ -271,16 +271,14 @@ def test_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     coladiff = CoLADiffusionModel(in_channels=4, out_channels=1).to(device)
 
-    # Simulate 3D input data
-    num_slices = 10  # Reduced from 155 to 10 to save memory
-    x_cond_3d = torch.randn(1, 3, num_slices, 240, 240).to(device)  # Reduced image size to 128x128
-    x_t_3d = torch.randn(1, 1, num_slices, 240, 240).to(device)
+    # Simulate 2D input data
+    batch_size = 1
+    height, width = 240, 240  # Use your desired image dimensions
 
-    # Reshape to batch of 2D slices
-    x_cond = x_cond_3d.squeeze(0).permute(1, 0, 2, 3)
-    x_t = x_t_3d.squeeze(0).permute(1, 0, 2, 3)
+    x_cond = torch.randn(batch_size, 3, height, width).to(device)  # Conditioning images (T1, T1c, FLAIR)
+    x_t = torch.randn(batch_size, 1, height, width).to(device)     # Noisy T2 image
 
-    t = torch.tensor([500], dtype=torch.float32).repeat(num_slices).to(device)
+    t = torch.tensor([500], dtype=torch.float32).to(device)  # Time step for the batch
 
     # Forward pass
     predicted_noise = coladiff(x_t, x_cond, t)
@@ -293,9 +291,10 @@ def test_model():
         generated_t2 = coladiff.ddim_sample(x_cond, num_inference_steps=20, eta=0.0)
     print(f"Generated T2 shape: {generated_t2.shape}")
 
-    # Reshape generated T2 to 3D volume
-    generated_t2_3d = generated_t2.squeeze(1).unsqueeze(0)
-    print(f"Generated T2 3D shape: {generated_t2_3d.shape}")
+    # Optionally, visualize the input and output images
+    # Denormalize and convert tensors to NumPy arrays for visualization
+    # ...
+
     return coladiff
 
 if __name__ == "__main__":

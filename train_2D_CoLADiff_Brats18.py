@@ -10,7 +10,7 @@ import torchio as tio
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_2D_CoLADiff_Brats18 import CoLADiff2D
+from model_2D_ import CoLADiffusionModel
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
@@ -128,25 +128,25 @@ class BrainMRI2DDataset(Dataset):
         all_target_values = []
         for data_entry in tqdm(data_list, desc="Computing global normalization parameters"):
             # Load all volumes
-            flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))
             t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))
             t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))
+            flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))
             t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))
 
             # Select valid slices
             valid_slices = []
-            for slice_idx in range(slice_range[0], min(slice_range[1], flair.shape[0])):
-                if (flair[slice_idx].max() > corrupt_threshold and
-                        t1[slice_idx].max() > corrupt_threshold and
+            for slice_idx in range(slice_range[0], min(slice_range[1], t1.shape[0])):
+                if (t1[slice_idx].max() > corrupt_threshold and
                         t1c[slice_idx].max() > corrupt_threshold and
+                        flair[slice_idx].max() > corrupt_threshold and
                         t2[slice_idx].max() > corrupt_threshold):
                     valid_slices.append(slice_idx)
 
             # Collect pixel values from valid slices
             if valid_slices:
-                input_slices = np.stack([flair[valid_slices], t1c[valid_slices], t2[valid_slices]],
+                input_slices = np.stack([t1[valid_slices], t1c[valid_slices], flair[valid_slices]],
                                         axis=1)  # [slices, modalities, H, W]
-                target_slices = t1[valid_slices]  # [slices, H, W]
+                target_slices = t2[valid_slices]  # [slices, H, W]
 
                 all_input_values.append(input_slices)
                 all_target_values.append(target_slices)
@@ -171,9 +171,9 @@ class BrainMRI2DDataset(Dataset):
         data_entry = self.data_list[data_idx]
 
         # Load all modalities
-        flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))[slice_idx]
         t1 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1']))[slice_idx]
         t1c = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T1c']))[slice_idx]
+        flair = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['FLAIR']))[slice_idx]
         t2 = sitk.GetArrayFromImage(sitk.ReadImage(data_entry['T2']))[slice_idx]
 
         # Define x_cond and target_slice
@@ -232,7 +232,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
     axes[0, 0].imshow(input_slices[0], cmap='gray')
-    axes[0, 0].set_title('FLAIR')
+    axes[0, 0].set_title('T1')
     axes[0, 0].axis('off')
 
     axes[0, 1].imshow(input_slices[1], cmap='gray')
@@ -240,15 +240,15 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     axes[0, 1].axis('off')
 
     axes[0, 2].imshow(input_slices[2], cmap='gray')
-    axes[0, 2].set_title('T2')
+    axes[0, 2].set_title('FLAIR')
     axes[0, 2].axis('off')
 
     axes[1, 0].imshow(target_slice, cmap='gray')
-    axes[1, 0].set_title('Ground Truth T1')
+    axes[1, 0].set_title('Ground Truth T2')
     axes[1, 0].axis('off')
 
     axes[1, 1].imshow(output_slice, cmap='gray')
-    axes[1, 1].set_title('Generated T1')
+    axes[1, 1].set_title('Generated T2')
     axes[1, 1].axis('off')
 
     difference = np.abs(target_slice - output_slice)
@@ -261,7 +261,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_coladiff_brats18.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_coladiffV2_brats18.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -271,7 +271,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_coladiff
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_coladiff_brats18.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_coladiffV2_brats18.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -294,14 +294,17 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
         x_cond, targets = x_cond.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        with autocast(device_type=device.type, enabled=torch.cuda.is_available()):
+        with autocast():
             # Generate random time steps
             t = torch.randint(0, config['n_steps'], (targets.size(0),), device=device).long()
 
+            # Get precomputed alpha values
+            sqrt_alphas_cumprod_t = model.sqrt_alphas_cumprod[t][:, None, None, None]
+            sqrt_one_minus_alphas_cumprod_t = model.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
+
             # Generate noise and x_t
             noise = torch.randn_like(targets)
-            alpha_t = model.alpha_schedule(t).view(-1, 1, 1, 1)
-            x_t = torch.sqrt(alpha_t) * targets + torch.sqrt(1 - alpha_t) * noise
+            x_t = sqrt_alphas_cumprod_t * targets + sqrt_one_minus_alphas_cumprod_t * noise
 
             # Forward pass
             predicted_noise = model(x_t, x_cond, t.float())
@@ -333,10 +336,13 @@ def validate(model, val_loader, device, epoch, writer, config):
             # Generate random time steps
             t = torch.randint(0, config['n_steps'], (targets.size(0),), device=device).long()
 
+            # Get precomputed alpha values
+            sqrt_alphas_cumprod_t = model.sqrt_alphas_cumprod[t][:, None, None, None]
+            sqrt_one_minus_alphas_cumprod_t = model.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
+
             # Generate noise and x_t
             noise = torch.randn_like(targets)
-            alpha_t = model.alpha_schedule(t).view(-1, 1, 1, 1)
-            x_t = torch.sqrt(alpha_t) * targets + torch.sqrt(1 - alpha_t) * noise
+            x_t = sqrt_alphas_cumprod_t * targets + sqrt_one_minus_alphas_cumprod_t * noise
 
             # Forward pass
             predicted_noise = model(x_t, x_cond, t.float())
@@ -346,7 +352,7 @@ def validate(model, val_loader, device, epoch, writer, config):
             val_loss += loss.item()
 
             # Sampling to generate images
-            generated_images = model.sample(x_cond, num_inference_steps=50)
+            generated_images = model.ddim_sample(x_cond, num_inference_steps=20, eta=0.0)
 
             # Calculate PSNR and SSIM
             mse_loss = nn.MSELoss()(generated_images, targets)
@@ -366,8 +372,7 @@ def validate(model, val_loader, device, epoch, writer, config):
 
     return val_loss, val_psnr, val_ssim
 
-
-def train(model, train_loader, val_loader, optimizer, num_epochs, device, writer, config):
+def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, device, writer, config):
     scaler = GradScaler(enabled=torch.cuda.is_available())
     best_val_loss = float('inf')
     patience = 25
@@ -398,6 +403,9 @@ def train(model, train_loader, val_loader, optimizer, num_epochs, device, writer
             print(f"Early stopping triggered after {epoch + 1} epochs")
             break
 
+        # Step the scheduler after each epoch
+        scheduler.step()
+
     print("Training completed successfully!")
     return epoch + 1
 
@@ -407,16 +415,20 @@ def main():
     np.random.seed(42)
 
     config = {
-        'batch_size': 16,
+        'batch_size': 8,
         'num_epochs': 200,
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
-        'n_steps': 2000,
+        'n_steps': 1000,
         'time_dim': 512,
-        'features': [64, 128, 256, 512, 1024]
+        'num_channels': 64,  # Reduced to save memory
+        'channel_mults': (1, 2, 2, 4),
+        'num_res_blocks': 2,
+        'attention_resolutions': [16],
+        'dropout': 0.0
     }
 
-    device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -468,30 +480,42 @@ def main():
     )
 
     # Initialize enhanced SynDiff2D model
-    model = CoLADiff2D(
+    # Initialize the CoLADiffusionModel
+    model = CoLADiffusionModel(
         in_channels=4,  # 1 (x_t) + 3 (x_cond)
         out_channels=1,
-        time_dim=config['time_dim'],
-        n_steps=config['n_steps'],
-        features=config['features']
+        num_channels=config['num_channels'],
+        channel_mults=config['channel_mults'],
+        num_res_blocks=config['num_res_blocks'],
+        attention_resolutions=config['attention_resolutions'],
+        dropout=config['dropout'],
+        n_steps=config['n_steps']
     ).to(device)
 
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
-    writer = SummaryWriter('runs/coladiff_brats18')
+    writer = SummaryWriter('runs/coladiffV2_brats18')
 
     start_epoch = load_checkpoint(model, optimizer)
 
-    final_epoch = train(model, train_loader, val_loader, optimizer, config['num_epochs'] - start_epoch, device, writer,
-                        config)
+    final_epoch = train(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        config['num_epochs'] - start_epoch,
+        device,
+        writer,
+        config
+    )
 
-    # Step the scheduler after each epoch
-    scheduler.step()
 
-    torch.save(model.state_dict(), 'coladiff_model_brats18.pth')
 
-    with open('patient_normalization_params_coladiff_brats18.json', 'w') as f:
+    torch.save(model.state_dict(), 'coladiff_model_brats18V2.pth')
+
+    with open('patient_normalization_params_coladiff_brats18V2.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
