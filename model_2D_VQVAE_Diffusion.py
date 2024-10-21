@@ -222,8 +222,11 @@ class LatentDiffusionVQVAEUNet(nn.Module):
 
         quantized = self.self_attention(quantized)
 
-        # Apply diffusion process
-        diffusion_loss = self.diffusion.loss_function(quantized, timesteps)
+        # Apply diffusion process only during training
+        if self.training and timesteps is not None:
+            diffusion_loss = self.diffusion.loss_function(quantized, timesteps)
+        else:
+            diffusion_loss = torch.tensor(0.0, device=x_cond.device)
 
         # For inference, use the full reverse process
         if not self.training:

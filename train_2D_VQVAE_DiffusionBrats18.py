@@ -327,12 +327,12 @@ def validate(model, val_loader, device, epoch, writer, config):
         for batch_idx, (x_cond, targets, _) in enumerate(tqdm(val_loader, desc="Validation")):
             x_cond, targets = x_cond.to(device), targets.to(device)
 
-            # Forward pass
-            output, vq_loss, diffusion_loss = model(x_cond, None)  # Pass None for t during inference
+            # Forward pass without timesteps
+            output, vq_loss, _ = model(x_cond, None)
 
-            # Compute loss
+            # Compute loss (excluding diffusion loss during validation)
             mse_loss = F.mse_loss(output, targets)
-            loss = mse_loss + vq_loss + diffusion_loss
+            loss = mse_loss + vq_loss
             val_loss += loss.item()
 
             # Calculate PSNR
