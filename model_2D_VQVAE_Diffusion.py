@@ -202,6 +202,46 @@ class DiffusionModel(nn.Module):
                 img += torch.sqrt(self.betas[i]) * noise
         return img
 
+    @torch.no_grad()
+    def ddim_sample(self, shape, num_steps=100):
+        """Faster sampling using DDIM."""
+        device = next(self.parameters()).device
+        b = shape[0]
+
+        # Select timesteps for sampling
+        timesteps = torch.linspace(0, self.num_timesteps - 1, num_steps, dtype=torch.long, device=device)
+
+        # Start from random noise
+        x = torch.randn(shape, device=device)
+
+        for i in tqdm(reversed(range(len(timesteps))), desc='DDIM Sampling'):
+            t = torch.full((b,), timesteps[i], device=device, dtype=torch.long)
+
+            # Get alpha values
+            alpha_cumprod_t = self.alphas_cumprod[t]
+            alpha_cumprod_t_prev = self.alphas_cumprod[t - 1] if i > 0 else torch.ones_like(alpha_cumprod_t)
+
+            # Predict noise
+            pred_noise = self.reverse_diffusion(x, t)
+
+            # DDIM update step
+            pred_x0 = (x - torch.sqrt(1 - alpha_cumprod_t).view(-1, 1, 1, 1) * pred_noise) / torch.sqrt(
+                alpha_cumprod_t).view(-1, 1, 1, 1)
+            pred_x0 = torch.clamp(pred_x0, -1, 1)
+
+            # Get the direction between timesteps
+            sigma = 0  # You can experiment with different values
+            direction = torch.sqrt(1 - alpha_cumprod_t_prev - sigma ** 2) * pred_noise
+
+            # Update x
+            x = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + direction
+
+            if i > 0:
+                noise = torch.randn_like(x)
+                x = x + sigma * noise
+
+        return x
+
 
 class LatentDiffusionVQVAEUNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=1, latent_dim=128, num_embeddings=512, commitment_cost=0.25,
@@ -237,29 +277,23 @@ class LatentDiffusionVQVAEUNet(nn.Module):
         return out, vq_loss, diffusion_loss
 
     @torch.no_grad()
-    def sample(self, x_cond):
+    def sample(self, x_cond, fast_sampling=True):
         batch_size = x_cond.shape[0]
         device = x_cond.device
 
         # Encode input modalities
         latent = self.encoder(x_cond)
-
         quantized, _, _ = self.quantizer(latent)
-
         quantized = self.self_attention(quantized)
 
-        # Sample from the diffusion model
-        x = torch.randn_like(quantized)
-        for i in reversed(range(self.diffusion.num_timesteps)):
-            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            x = self.diffusion.reverse_diffusion(x, t)
-            if i > 0:
-                noise = torch.randn_like(x)
-                x += torch.sqrt(self.diffusion.betas[i]) * noise
+        # Use faster sampling during validation
+        if fast_sampling:
+            x = self.diffusion.ddim_sample(quantized.shape, num_steps=100)  # Reduced steps
+        else:
+            x = self.diffusion.sample(quantized.shape)  # Original full sampling
 
         # Decode the sampled latent
         out = self.decoder(x)
-
         return out
 
 

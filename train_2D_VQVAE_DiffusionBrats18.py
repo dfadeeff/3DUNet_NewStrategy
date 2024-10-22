@@ -262,7 +262,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_vqvae_brats18.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_vqvaev2_brats18.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -272,7 +272,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_vqvae_br
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_vqvae_brats18.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_vqvaev2_brats18.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -327,20 +327,22 @@ def validate(model, val_loader, device, epoch, writer, config):
         for batch_idx, (x_cond, targets, _) in enumerate(tqdm(val_loader, desc="Validation")):
             x_cond, targets = x_cond.to(device), targets.to(device)
 
-            # Forward pass without timesteps
+            # Forward pass with fast sampling
             output, vq_loss, _ = model(x_cond, None)
 
-            # Compute loss (excluding diffusion loss during validation)
+            if not model.training:
+                # Use fast sampling during inference
+                output = model.sample(x_cond, fast_sampling=True)
+
+            # Compute metrics...
             mse_loss = F.mse_loss(output, targets)
             loss = mse_loss + vq_loss
             val_loss += loss.item()
 
-            # Calculate PSNR
             psnr = -10 * torch.log10(mse_loss)
             val_psnr += psnr.item()
 
-            # Calculate SSIM
-            ssim_value = ssim(output, targets, data_range=2.0, size_average=True)  # data_range is 2 for [-1, 1]
+            ssim_value = ssim(output, targets, data_range=2.0, size_average=True)
             val_ssim += ssim_value.item()
 
             num_batches += 1
@@ -348,6 +350,7 @@ def validate(model, val_loader, device, epoch, writer, config):
             if batch_idx == 0:
                 visualize_batch(x_cond, targets, output, epoch, batch_idx, writer)
 
+    # Average metrics
     val_loss /= num_batches
     val_psnr /= num_batches
     val_ssim /= num_batches
@@ -410,7 +413,7 @@ def main():
         'dropout': 0.0
     }
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -475,7 +478,7 @@ def main():
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['num_epochs'])
-    writer = SummaryWriter('runs/vqvae_brats18')
+    writer = SummaryWriter('runs/vqvaev2_brats18')
 
     start_epoch = load_checkpoint(model, optimizer)
 
@@ -491,9 +494,9 @@ def main():
         config
     )
 
-    torch.save(model.state_dict(), 'vqvae_brats18.pth')
+    torch.save(model.state_dict(), 'vqvaev2_brats18.pth')
 
-    with open('patient_normalization_params_vqvae_brats18.json', 'w') as f:
+    with open('patient_normalization_params_vqvaev2_brats18.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
