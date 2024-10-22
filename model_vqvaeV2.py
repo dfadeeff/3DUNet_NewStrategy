@@ -284,6 +284,7 @@ class AnatomicalDiffusion(nn.Module):
 
         return x
 
+
 class ImprovedLatentDiffusion(nn.Module):
     def __init__(self, in_channels=3, out_channels=1, latent_dim=256, hidden_dims=128):
         super().__init__()
@@ -401,4 +402,3 @@ def test_model_basic():
 
 if __name__ == "__main__":
     test_model_basic()
-
