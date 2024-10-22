@@ -69,39 +69,66 @@ class ResidualBlock(nn.Module):
 class VQVAEEncoder(nn.Module):
     def __init__(self, in_channels, hidden_dims, latent_dim):
         super(VQVAEEncoder, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dims, 4, stride=2, padding=1),
-            nn.ReLU(),
+        self.initial_conv = nn.Conv2d(in_channels, hidden_dims, 3, padding=1)
+
+        # Encoder blocks with skip connections
+        self.enc1 = nn.Sequential(
             ResidualBlock(hidden_dims, hidden_dims),
-            nn.Conv2d(hidden_dims, hidden_dims * 2, 4, stride=2, padding=1),
-            nn.ReLU(),
-            ResidualBlock(hidden_dims * 2, hidden_dims * 2),
-            nn.Conv2d(hidden_dims * 2, latent_dim, 3, stride=1, padding=1),
-            nn.ReLU()
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(hidden_dims, hidden_dims, 4, stride=2, padding=1)
+        )
+
+        self.enc2 = nn.Sequential(
+            ResidualBlock(hidden_dims, hidden_dims * 2),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(hidden_dims * 2, hidden_dims * 2, 4, stride=2, padding=1)
+        )
+
+        self.final_conv = nn.Sequential(
+            ResidualBlock(hidden_dims * 2, latent_dim),
+            nn.Conv2d(latent_dim, latent_dim, 3, padding=1)
         )
 
     def forward(self, x):
-        return self.encoder(x)
+        x = self.initial_conv(x)
+        feat1 = self.enc1(x)
+        feat2 = self.enc2(feat1)
+        latent = self.final_conv(feat2)
+        return latent, [feat1, feat2]
 
 
 class VQVAEDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dims, out_channels):
         super(VQVAEDecoder, self).__init__()
-        self.decoder = nn.Sequential(
-            ResidualBlock(latent_dim, latent_dim),
-            nn.ConvTranspose2d(latent_dim, hidden_dims * 2, 4, stride=2, padding=1),
-            nn.ReLU(),
-            ResidualBlock(hidden_dims * 2, hidden_dims * 2),
-            nn.ConvTranspose2d(hidden_dims * 2, hidden_dims, 4, stride=2, padding=1),
-            nn.ReLU(),
-            ResidualBlock(hidden_dims, hidden_dims),
-            nn.Conv2d(hidden_dims, out_channels, 3, stride=1, padding=1),
-            nn.Sigmoid()
+
+        self.initial_conv = nn.Conv2d(latent_dim, hidden_dims * 2, 3, padding=1)
+
+        self.dec1 = nn.Sequential(
+            ResidualBlock(hidden_dims * 2 * 2, hidden_dims * 2),  # *2 for skip connection
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose2d(hidden_dims * 2, hidden_dims, 4, stride=2, padding=1)
         )
 
-    def forward(self, x):
-        return self.decoder(x)
+        self.dec2 = nn.Sequential(
+            ResidualBlock(hidden_dims * 2, hidden_dims),  # *2 for skip connection
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose2d(hidden_dims, hidden_dims, 4, stride=2, padding=1)
+        )
 
+        self.final_conv = nn.Sequential(
+            ResidualBlock(hidden_dims, hidden_dims),
+            nn.Conv2d(hidden_dims, out_channels, 3, padding=1),
+            nn.Tanh()  # Change to Tanh for [-1, 1] range
+        )
+
+    def forward(self, x, skip_features):
+        x = self.initial_conv(x)
+        x = torch.cat([x, skip_features[1]], dim=1)
+        x = self.dec1(x)
+        x = torch.cat([x, skip_features[0]], dim=1)
+        x = self.dec2(x)
+        out = self.final_conv(x)
+        return out
 
 class SelfAttention(nn.Module):
     def __init__(self, channels):
@@ -225,8 +252,12 @@ class DiffusionModel(nn.Module):
             pred_noise = self.reverse_diffusion(x, t)
 
             # DDIM update step
-            pred_x0 = (x - torch.sqrt(1 - alpha_cumprod_t).view(-1, 1, 1, 1) * pred_noise) / torch.sqrt(
-                alpha_cumprod_t).view(-1, 1, 1, 1)
+            # Add proper broadcasting
+            alpha_cumprod_t = alpha_cumprod_t.view(-1, 1, 1, 1)
+            alpha_cumprod_t_prev = alpha_cumprod_t_prev.view(-1, 1, 1, 1)
+
+            # Predict x0
+            pred_x0 = (x - torch.sqrt(1 - alpha_cumprod_t) * pred_noise) / torch.sqrt(alpha_cumprod_t)
             pred_x0 = torch.clamp(pred_x0, -1, 1)
 
             # Get the direction between timesteps
