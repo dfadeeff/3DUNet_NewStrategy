@@ -87,7 +87,7 @@ class EnhancedMemoryEfficientAttention(nn.Module):
         )
 
         # Larger chunk size for better parallelization
-        self.chunk_size = 1024  # Kept at 1024
+        self.chunk_size = 512  # Reduced from 1024
 
     def forward(self, x):
         b, c, h, w = x.shape
@@ -323,7 +323,7 @@ class ImprovedLatentDiffusion(nn.Module):
         self.diffusion = AnatomicalDiffusion(latent_dim)
 
         # VQ layer
-        self.num_embeddings = 4096
+        self.num_embeddings = 2048
         self.embedding = nn.Embedding(self.num_embeddings, latent_dim)
         self.embedding.weight.data.uniform_(-1 / self.num_embeddings, 1 / self.num_embeddings)
 
@@ -334,7 +334,7 @@ class ImprovedLatentDiffusion(nn.Module):
 
         self.decay = 0.99
         self.eps = 1e-5
-        self.commitment_cost = 0.25  # Increased from 0.1 for better codebook usage
+        self.commitment_cost = 0.5  # Increased from 0.1 for better codebook usage
 
     def _update_ema(self, flat_input, encoding_indices):
         # EMA update for embeddings
@@ -360,50 +360,44 @@ class ImprovedLatentDiffusion(nn.Module):
         # Flatten input
         flat_input = z.permute(0, 2, 3, 1).reshape(-1, z.shape[1])
 
-        # Calculate distances with improved numerical stability
-        flat_input_norm = torch.sum(flat_input ** 2, dim=1, keepdim=True)
-        embedding_norm = torch.sum(self.embedding.weight ** 2, dim=1)
-        distances = flat_input_norm + embedding_norm - 2 * torch.matmul(flat_input, self.embedding.weight.t())
+        # Compute distances in chunks
+        chunk_size = 1024
+        distances = []
 
-        # Get nearest codebook entries
+
+        for i in range(0, flat_input.size(0), chunk_size):
+            chunk = flat_input[i:i + chunk_size]
+            chunk_norm = torch.sum(chunk ** 2, dim=1, keepdim=True)
+            embedding_norm = torch.sum(self.embedding.weight ** 2, dim=1)
+            chunk_dist = chunk_norm + embedding_norm - 2 * torch.matmul(chunk, self.embedding.weight.t())
+            distances.append(chunk_dist)
+
+        distances = torch.cat(distances, dim=0)
         encoding_indices = torch.argmin(distances, dim=1)
 
         if self.training:
-            # Important: Update EMA before using embeddings
             self._update_ema(flat_input, encoding_indices)
 
-        # Use updated embeddings
         quantized = self.embedding(encoding_indices)
-
-        # Reshape to original size
         quantized = quantized.view(z.shape[0], z.shape[2], z.shape[3], z.shape[1])
-        quantized = quantized.permute(0, 3, 1, 2).contiguous()  # Added contiguous()
+        quantized = quantized.permute(0, 3, 1, 2).contiguous()
 
-        # Calculate losses
+        # Calculate losses more efficiently
         commitment_loss = F.mse_loss(z.detach(), quantized)
         codebook_loss = F.mse_loss(z, quantized.detach())
-
-        # Combined loss with commitment term
         q_loss = codebook_loss + self.commitment_cost * commitment_loss
 
-        # Add Laplace smoothing to prevent unused codes
-        if self.training:
-            # Calculate usage
+
+        # Monitor codebook usage less frequently
+        if self.training and int(self.ema_updated.item()) % 200 == 0:
             encodings = F.one_hot(encoding_indices, self.num_embeddings).float()
             curr_usage = torch.mean(encodings, dim=0)
-            # Apply Laplace smoothing
             curr_usage = (curr_usage + self.eps) / (1 + self.num_embeddings * self.eps)
-            # Calculate perplexity
             perplexity = torch.exp(-torch.sum(curr_usage * torch.log(curr_usage + 1e-10)))
+            print(f"Active codes: {(curr_usage > 0.001).sum().item()}/{self.num_embeddings}")
+            print(f"Codebook perplexity: {perplexity.item():.2f}")
 
-            # Log every 100 updates for monitoring
-            if int(self.ema_updated.item()) % 100 == 0:
-                print(f"Active codes: {(curr_usage > 0.001).sum().item()}/{self.num_embeddings}")
-                print(f"Codebook perplexity: {perplexity.item():.2f}")
-
-        # Straight-through estimator
         quantized = z + (quantized - z).detach()
-
         return quantized, q_loss
 
     def forward(self, x, timesteps=None):

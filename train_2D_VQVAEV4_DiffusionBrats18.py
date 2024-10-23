@@ -1,5 +1,6 @@
 import torch.multiprocessing as mp
 import torch
+import gc
 import torch.nn as nn
 from torch.utils.data.dataloader import default_collate
 import torch.optim as optim
@@ -295,12 +296,12 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
     running_diff_loss = 0.0
 
     # Add gradient accumulation
-    accumulation_steps = 2  # Effectively halves memory usage
+    accumulation_steps = 8  # Effectively halves memory usage
     optimizer.zero_grad()
 
     for batch_idx, (x_cond, targets, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
         # Clear cache more frequently
-        if batch_idx % 20 == 0:  # Increased frequency
+        if batch_idx % 10 == 0:  # Increased frequency
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -457,8 +458,8 @@ def main():
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
         'n_steps': 500,
-        'hidden_dims': 128,
-        'latent_dim': 256
+        'hidden_dims': 64,
+        'latent_dim': 128
     }
 
     device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
