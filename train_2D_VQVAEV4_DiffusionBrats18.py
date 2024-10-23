@@ -294,39 +294,67 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
     running_vq_loss = 0.0
     running_diff_loss = 0.0
 
+    # Add gradient accumulation
+    accumulation_steps = 2  # Effectively halves memory usage
+    optimizer.zero_grad()
+
     for batch_idx, (x_cond, targets, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
-        x_cond, targets = x_cond.to(device), targets.to(device)
+        # Clear cache more frequently
+        if batch_idx % 20 == 0:  # Increased frequency
+            torch.cuda.empty_cache()
+            gc.collect()
 
-        optimizer.zero_grad()
-        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
-            # Use curriculum learning for timesteps
-            max_t = min(int((epoch / 20) * config['n_steps']) + 100, config['n_steps'])
-            t = torch.randint(0, max_t, (x_cond.size(0),), device=device).long()
+        # Split batch processing if needed
+        batch_size = x_cond.size(0)
+        split_size = batch_size // 2  # Process half batch at a time
 
-            # Forward pass
-            output, vq_loss, diffusion_loss = model(x_cond, t)
+        total_loss = 0
+        for i in range(0, batch_size, split_size):
+            end_idx = min(i + split_size, batch_size)
+            x_cond_split = x_cond[i:end_idx].to(device)
+            targets_split = targets[i:end_idx].to(device)
 
-            # Combined reconstruction loss using L1 and SSIM
-            recon_loss = (0.5 * F.l1_loss(output, targets) +  0.3 * F.mse_loss(output, targets) + 0.2 * (1 - ssim(output, targets, data_range=2.0)))
+            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
+                          enabled=torch.cuda.is_available()):
+                # Use curriculum learning for timesteps
+                max_t = min(int((epoch / 20) * config['n_steps']) + 100, config['n_steps'])
+                t = torch.randint(0, max_t, (end_idx - i,), device=device).long()
 
-            # Total loss
-            loss = recon_loss + 0.05 * vq_loss + 0.1 * diffusion_loss
+                # Forward pass
+                output, vq_loss, diffusion_loss = model(x_cond_split, t)
 
-        # Backward pass
-        scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+                # Combined reconstruction loss
+                recon_loss = (0.5 * F.l1_loss(output, targets_split) +
+                              0.3 * F.mse_loss(output, targets_split) +
+                              0.2 * (1 - ssim(output, targets_split, data_range=2.0)))
 
-        # Update metrics
-        running_loss += loss.item()
-        running_recon_loss += recon_loss.item()
-        running_vq_loss += vq_loss.item()
-        running_diff_loss += diffusion_loss.item()
+                # Scale loss by accumulation steps
+                loss = (recon_loss + 0.05 * vq_loss + 0.1 * diffusion_loss) / accumulation_steps
+
+                # Accumulate loss metrics
+                running_loss += loss.item() * accumulation_steps
+                running_recon_loss += recon_loss.item()
+                running_vq_loss += vq_loss.item()
+                running_diff_loss += diffusion_loss.item()
+
+            # Backward pass with gradient accumulation
+            scaler.scale(loss).backward()
+
+            # Clear memory
+            del output, vq_loss, diffusion_loss, loss
+            torch.cuda.empty_cache()
+
+        # Update weights every accumulation_steps
+        if (batch_idx + 1) % accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
         # Log intermediate metrics
         if batch_idx % 100 == 0:
-            writer.add_scalar('Batch/Loss', loss.item(), epoch * len(train_loader) + batch_idx)
+            writer.add_scalar('Batch/Loss', running_loss / (batch_idx + 1),
+                              epoch * len(train_loader) + batch_idx)
 
     # Calculate epoch averages
     epoch_loss = running_loss / len(train_loader)
@@ -428,12 +456,12 @@ def main():
         'num_epochs': 100,
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
-        'n_steps': 1000,
-        'hidden_dims': 160,
-        'latent_dim': 320
+        'n_steps': 500,
+        'hidden_dims': 128,
+        'latent_dim': 256
     }
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Dataset paths
