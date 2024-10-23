@@ -10,7 +10,7 @@ import torchio as tio
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_vqvaeV4 import ImprovedLatentDiffusion
+from model_vqvaeV5 import EfficientSOTADiffusion
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
@@ -262,7 +262,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_improved_diffusionV3.pth"):
+def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_improved_diffusionV4.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -272,7 +272,7 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="checkpoint_improved
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_improved_diffusionV3.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_improved_diffusionV4.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -291,26 +291,31 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
     model.train()
     running_loss = 0.0
     running_recon_loss = 0.0
-    running_vq_loss = 0.0
-    running_diff_loss = 0.0
+    running_edge_loss = 0.0
+    running_ssim_loss = 0.0
 
     for batch_idx, (x_cond, targets, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
         x_cond, targets = x_cond.to(device), targets.to(device)
 
         optimizer.zero_grad()
         with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
-            # Use curriculum learning for timesteps
-            max_t = min(int((epoch / 20) * config['n_steps']) + 100, config['n_steps'])
-            t = torch.randint(0, max_t, (x_cond.size(0),), device=device).long()
+            # Create noisy target
+            t = torch.randint(0, config['n_steps'], (x_cond.size(0),), device=device)
+            noise = torch.randn_like(targets)
+            noisy_target = model._add_noise(targets, t, noise)
+
+            # Concatenate noisy target with condition
+            model_input = torch.cat([noisy_target, x_cond], dim=1)
 
             # Forward pass
-            output, vq_loss, diffusion_loss = model(x_cond, t)
+            pred = model(model_input, t)
 
-            # Combined reconstruction loss using L1 and SSIM
-            recon_loss = (0.5 * F.l1_loss(output, targets) +  0.3 * F.mse_loss(output, targets) + 0.2 * (1 - ssim(output, targets, data_range=2.0)))
+            # Multi-component loss
+            recon_loss = 0.5 * F.l1_loss(pred, targets)
+            edge_loss = 0.3 * model._edge_loss(pred, targets)
+            ssim_loss = 0.2 * (1 - model._ssim(pred, targets))
 
-            # Total loss
-            loss = recon_loss + 0.05 * vq_loss + 0.1 * diffusion_loss
+            loss = recon_loss + edge_loss + ssim_loss
 
         # Backward pass
         scaler.scale(loss).backward()
@@ -321,8 +326,8 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
         # Update metrics
         running_loss += loss.item()
         running_recon_loss += recon_loss.item()
-        running_vq_loss += vq_loss.item()
-        running_diff_loss += diffusion_loss.item()
+        running_edge_loss += edge_loss.item()
+        running_ssim_loss += ssim_loss.item()
 
         # Log intermediate metrics
         if batch_idx % 100 == 0:
@@ -331,8 +336,8 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
     # Calculate epoch averages
     epoch_loss = running_loss / len(train_loader)
     writer.add_scalar('Training/ReconLoss', running_recon_loss / len(train_loader), epoch)
-    writer.add_scalar('Training/VQLoss', running_vq_loss / len(train_loader), epoch)
-    writer.add_scalar('Training/DiffusionLoss', running_diff_loss / len(train_loader), epoch)
+    writer.add_scalar('Training/EdgeLoss', running_edge_loss / len(train_loader), epoch)
+    writer.add_scalar('Training/SSIMLoss', running_ssim_loss / len(train_loader), epoch)
 
     return epoch_loss
 
@@ -348,8 +353,8 @@ def validate(model, val_loader, device, epoch, writer, config):
         for batch_idx, (x_cond, targets, _) in enumerate(tqdm(val_loader, desc="Validation")):
             x_cond, targets = x_cond.to(device), targets.to(device)
 
-            # Use fast sampling for validation
-            output = model.sample(x_cond, fast_sampling=True)
+            # Use DDIM sampling
+            output = model.ddim_sample(x_cond, num_inference_steps=20)  # Changed from model.sample()
 
             # Compute metrics
             mse_loss = F.mse_loss(output, targets)
@@ -429,11 +434,10 @@ def main():
         'learning_rate': 1e-4,
         'slice_range': (2, 150),
         'n_steps': 1000,
-        'hidden_dims': 160,
-        'latent_dim': 320
+        'base_channels': 64
     }
 
-    device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Dataset paths
@@ -488,12 +492,11 @@ def main():
         pin_memory=True
     )
 
-    # Initialize model
-    model = ImprovedLatentDiffusion(
-        in_channels=3,
+    # Initialize model - Key change here
+    model = EfficientSOTADiffusion(
+        in_channels=4,  # Changed to 4 (3 condition + 1 noisy)
         out_channels=1,
-        latent_dim=config['latent_dim'],
-        hidden_dims=config['hidden_dims']
+        base_channels=config['base_channels']
     ).to(device)
 
     # Optimizer and scheduler
@@ -512,7 +515,7 @@ def main():
         pct_start=0.1
     )
 
-    writer = SummaryWriter('runs/improved_latent_diffusionV3')
+    writer = SummaryWriter('runs/improved_latent_diffusionV4')
 
     # Load checkpoint if exists
     start_epoch = load_checkpoint(model, optimizer)
@@ -531,8 +534,8 @@ def main():
     )
 
     # Save final model and parameters
-    torch.save(model.state_dict(), 'improved_latent_diffusionV3.pth')
-    with open('normalization_paramsV3.json', 'w') as f:
+    torch.save(model.state_dict(), 'improved_latent_diffusionV4.pth')
+    with open('normalization_paramsV4.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
