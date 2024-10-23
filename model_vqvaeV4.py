@@ -7,6 +7,14 @@ from tqdm import tqdm
 
 
 class ImprovedAnatomicalResBlock(nn.Module):
+    """
+    Purpose: Edge-aware anatomical feature extraction
+    Key Integration Points:
+    - Multi-scale edge detection (3,5,7 kernels)
+    - Learned edge weighting
+    - Channel attention for feature refinement
+    """
+
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
@@ -62,6 +70,14 @@ class ImprovedAnatomicalResBlock(nn.Module):
 
 
 class EnhancedMemoryEfficientAttention(nn.Module):
+    """
+    Purpose: Global context modeling with memory efficiency
+    Key Integration Points:
+    - Chunk-based processing
+    - Squeeze-excitation for feature refinement
+    - Group convolutions for efficiency
+    """
+
     def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -212,6 +228,14 @@ class EnhancedVQVAEDecoder(nn.Module):
 
 
 class AnatomicalDiffusion(nn.Module):
+    """
+    Purpose: Progressive denoising with anatomical awareness
+    Key Integration Points:
+    - Custom noise schedule
+    - Anatomical-aware denoising network
+    - DDIM sampling for efficiency
+    """
+
     def __init__(self, channels, num_timesteps=1000):
         super().__init__()
         self.channels = channels
@@ -316,6 +340,14 @@ class AnatomicalDiffusion(nn.Module):
 
 
 class ImprovedLatentDiffusion(nn.Module):
+    """
+    Purpose: Discrete latent representation learning
+    Key Integration Points:
+    - EMA codebook updates
+    - Commitment loss balancing
+    - Efficient chunked quantization
+    """
+
     def __init__(self, in_channels=3, out_channels=1, latent_dim=256, hidden_dims=128):
         super().__init__()
         self.encoder = EnhancedVQVAEEncoder(in_channels, hidden_dims, latent_dim)
@@ -364,7 +396,6 @@ class ImprovedLatentDiffusion(nn.Module):
         chunk_size = 1024
         distances = []
 
-
         for i in range(0, flat_input.size(0), chunk_size):
             chunk = flat_input[i:i + chunk_size]
             chunk_norm = torch.sum(chunk ** 2, dim=1, keepdim=True)
@@ -386,7 +417,6 @@ class ImprovedLatentDiffusion(nn.Module):
         commitment_loss = F.mse_loss(z.detach(), quantized)
         codebook_loss = F.mse_loss(z, quantized.detach())
         q_loss = codebook_loss + self.commitment_cost * commitment_loss
-
 
         # Monitor codebook usage less frequently
         if self.training and int(self.ema_updated.item()) % 200 == 0:
