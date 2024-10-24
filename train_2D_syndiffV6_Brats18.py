@@ -287,181 +287,177 @@ def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV6.pth"):
         return 0
 
 
-def combined_loss(predicted_noise, target_noise, denoised, targets):
-    # Noise prediction loss
-    noise_loss = F.huber_loss(predicted_noise, target_noise, reduction='mean', delta=0.1)
-
-    # Reconstruction loss
-    recon_loss = F.l1_loss(denoised, targets)
-
-    # Combined loss with weighting
-    return noise_loss + 0.1 * recon_loss
-
-
 def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, config):
+    """Clean and simplified training epoch function"""
     model.train()
-    running_loss = 0.0
-    running_psnr = 0.0
-    running_ssim = 0.0
+    running_stats = {'loss': 0.0, 'psnr': 0.0, 'ssim': 0.0}
     n_batches = 0
 
     for batch_idx, (inputs, targets, _) in enumerate(tqdm(train_loader)):
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-
+        inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad(set_to_none=True)
 
         try:
-            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu',
                           enabled=torch.cuda.is_available()):
-                # Generate noise with controlled scale
-                # noise = torch.randn_like(targets).clamp(-1, 1)
-                noise = torch.randn_like(targets).clamp(-3, 3) * (1.0 / math.sqrt(config['n_steps']))
-
-                # Get timesteps
+                # Scaled noise based on timestep
                 t = torch.randint(1, config['n_steps'], (inputs.shape[0],), device=device)
+                noise = torch.randn_like(targets) * math.sqrt(1.0 / config['n_steps'])
 
-                # Get diffusion parameters
+                # More stable alpha computation
                 alpha = model.alpha_schedule(t)[:, None, None, None]
                 sqrt_alpha = torch.sqrt(alpha)
                 sqrt_one_minus_alpha = torch.sqrt(1 - alpha)
 
-                # Create noisy target with better scaling
+                # Noisy target
                 noisy_t2 = sqrt_alpha * targets + sqrt_one_minus_alpha * noise
 
-                # Model prediction
+                # Forward pass and denoising
                 model_input = torch.cat([inputs, noisy_t2], dim=1)
                 predicted_noise = model(model_input, t.float())
-
-                # Denoise for metrics
                 denoised = (noisy_t2 - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
 
-                # Combined loss
-                loss = combined_loss(predicted_noise, noise, denoised, targets)
+                # Combined loss computation
+                noise_loss = F.mse_loss(predicted_noise, noise)
+                recon_loss = F.l1_loss(denoised.clamp(-1, 1), targets)
+                loss = noise_loss + 0.1 * recon_loss  # Increased reconstruction weight
 
-                if not torch.isnan(loss):
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    scaler.step(optimizer)
-                    scaler.update()
+                # Skip bad batches
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
 
-                    # Compute metrics
-                    with torch.no_grad():
-                        mse = F.mse_loss(denoised, targets)
-                        psnr = -10 * torch.log10(mse + 1e-8)
-                        ssim_val = ssim(denoised, targets, data_range=2.0)
+                # Gradient computation and optimization
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Reduced clip value
+                scaler.step(optimizer)
+                scaler.update()
 
-                        running_loss += loss.item()
-                        running_psnr += psnr.item()
-                        running_ssim += ssim_val.item()
+                # Compute metrics
+                with torch.no_grad():
+                    mse = F.mse_loss(denoised.clamp(-1, 1), targets)
+                    psnr = -10 * torch.log10(mse.clamp(min=1e-8))
+                    ssim_val = ssim(denoised.clamp(-1, 1), targets, data_range=2.0)
+
+                    if not torch.isnan(psnr) and not torch.isnan(ssim_val):
+                        running_stats['loss'] += loss.item()
+                        running_stats['psnr'] += psnr.item()
+                        running_stats['ssim'] += ssim_val.item()
                         n_batches += 1
 
-                # Log batch metrics
+                # Log every 10 batches
                 if batch_idx % 10 == 0:
-                    writer.add_scalar('Batch/Loss', loss.item(), epoch * len(train_loader) + batch_idx)
-                    if n_batches > 0:
-                        writer.add_scalar('Batch/PSNR', psnr.item(), epoch * len(train_loader) + batch_idx)
-                        writer.add_scalar('Batch/SSIM', ssim_val.item(), epoch * len(train_loader) + batch_idx)
+                    writer.add_scalar('Train/BatchLoss', loss.item(), epoch * len(train_loader) + batch_idx)
+                    writer.add_scalar('Train/BatchPSNR', psnr.item(), epoch * len(train_loader) + batch_idx)
 
         except RuntimeError as e:
             print(f"Error in batch {batch_idx}: {str(e)}")
             continue
 
     if n_batches == 0:
-        return 0.0, 0.0, 0.0
+        return float('inf'), 0.0, 0.0
 
-    return (running_loss / n_batches,
-            running_psnr / n_batches,
-            running_ssim / n_batches)
+    return (running_stats['loss'] / n_batches,
+            running_stats['psnr'] / n_batches,
+            running_stats['ssim'] / n_batches)
 
 
 def validate(model, val_loader, device, epoch, writer, config):
+    """Simplified validation function with consistent metrics"""
     model.eval()
-    running_loss = 0.0
-    running_psnr = 0.0
-    running_ssim = 0.0
+    running_stats = {'loss': 0.0, 'psnr': 0.0, 'ssim': 0.0}
+    n_batches = 0
 
     with torch.no_grad():
-        for batch_idx, (inputs, targets, _) in enumerate(val_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
+        for batch_idx, (inputs, targets, _) in enumerate(tqdm(val_loader, desc="Validation")):
+            try:
+                inputs, targets = inputs.to(device), targets.to(device)
 
-            # Exactly same process as training
-            noise = torch.randn_like(targets)
-            t = torch.ones(inputs.shape[0], device=device) * (config['n_steps'] // 2)
-            alpha_t = model.alpha_schedule(t)[:, None, None, None]
+                # Fixed middle timestep for validation
+                t = torch.ones(inputs.shape[0], device=device) * (config['n_steps'] // 2)
+                noise = torch.randn_like(targets) * math.sqrt(1.0 / config['n_steps'])
 
-            noisy_t2 = torch.sqrt(alpha_t) * targets + torch.sqrt(1 - alpha_t) * noise
-            model_input = torch.cat([inputs, noisy_t2], dim=1)
-            predicted_noise = model(model_input, t.float())
+                alpha = model.alpha_schedule(t)[:, None, None, None]
+                sqrt_alpha = torch.sqrt(alpha)
+                sqrt_one_minus_alpha = torch.sqrt(1 - alpha)
 
-            # Loss on noise prediction
-            loss = F.mse_loss(predicted_noise, noise)
+                noisy_t2 = sqrt_alpha * targets + sqrt_one_minus_alpha * noise
+                model_input = torch.cat([inputs, noisy_t2], dim=1)
+                predicted_noise = model(model_input, t.float())
 
-            # Reconstruct using same formula as training
-            denoised_t2 = (noisy_t2 - torch.sqrt(1 - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
+                denoised = (noisy_t2 - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
 
-            # Metrics
-            mse = F.mse_loss(denoised_t2, targets)
-            psnr = -10 * torch.log10(mse)
-            ssim_val = ssim(denoised_t2, targets, data_range=2.0)
+                # Compute metrics
+                mse = F.mse_loss(denoised.clamp(-1, 1), targets)
+                psnr = -10 * torch.log10(mse.clamp(min=1e-8))
+                ssim_val = ssim(denoised.clamp(-1, 1), targets, data_range=2.0)
 
-            running_loss += loss.item()
-            running_psnr += psnr.item()
-            running_ssim += ssim_val.item()
+                if not torch.isnan(psnr) and not torch.isnan(ssim_val):
+                    running_stats['loss'] += mse.item()
+                    running_stats['psnr'] += psnr.item()
+                    running_stats['ssim'] += ssim_val.item()
+                    n_batches += 1
 
-            if batch_idx == 0:
-                visualize_batch(inputs, targets, denoised_t2, epoch, batch_idx, writer)
+                # Visualize first batch
+                if batch_idx == 0:
+                    visualize_batch(inputs, targets, denoised, epoch, batch_idx, writer)
 
-    num_batches = len(val_loader)
-    return (running_loss / num_batches,
-            running_psnr / num_batches,
-            running_ssim / num_batches)
+            except RuntimeError as e:
+                print(f"Error in validation batch {batch_idx}: {str(e)}")
+                continue
+
+    if n_batches == 0:
+        return float('inf'), 0.0, 0.0
+
+    return (running_stats['loss'] / n_batches,
+            running_stats['psnr'] / n_batches,
+            running_stats['ssim'] / n_batches)
 
 
 def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, device, writer, config):
+    """Streamlined training loop with better monitoring"""
     scaler = GradScaler(enabled=torch.cuda.is_available())
     best_val_loss = float('inf')
-    patience = 25
+    patience = 15  # Reduced patience
     patience_counter = 0
 
     for epoch in range(num_epochs):
-        # Train
+        # Training
         train_loss, train_psnr, train_ssim = train_epoch(
             model, train_loader, optimizer, scaler, device, epoch, writer, config)
 
-        # Validate
+        # Validation
         val_loss, val_psnr, val_ssim = validate(
-            model, val_loader, device, epoch, writer, config)  # Added config argument
+            model, val_loader, device, epoch, writer, config)
 
         # Step scheduler
         scheduler.step()
 
         # Logging
+        current_lr = optimizer.param_groups[0]['lr']
+        writer.add_scalar('Training/Epoch/Loss', train_loss, epoch)
+        writer.add_scalar('Training/Epoch/PSNR', train_psnr, epoch)
+        writer.add_scalar('Training/Epoch/SSIM', train_ssim, epoch)
+        writer.add_scalar('Training/LearningRate', current_lr, epoch)
+
         print(f"Epoch [{epoch + 1}/{num_epochs}]")
         print(f"Train - Loss: {train_loss:.4f}, PSNR: {train_psnr:.2f}, SSIM: {train_ssim:.4f}")
         print(f"Val - Loss: {val_loss:.4f}, PSNR: {val_psnr:.2f}, SSIM: {val_ssim:.4f}")
-
-        writer.add_scalar('Training/Loss', train_loss, epoch)
-        writer.add_scalar('Training/PSNR', train_psnr, epoch)
-        writer.add_scalar('Training/SSIM', train_ssim, epoch)
-        writer.add_scalar('Training/LR', scheduler.get_last_lr()[0], epoch)
-        writer.add_scalar('Validation/Loss', val_loss, epoch)
-        writer.add_scalar('Validation/PSNR', val_psnr, epoch)
-        writer.add_scalar('Validation/SSIM', val_ssim, epoch)
+        print(f"Learning Rate: {current_lr:.6f}")
 
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, scheduler, epoch, val_loss)
+            save_checkpoint(model, optimizer, scheduler, epoch, val_loss,
+                            filename=f"best_model_epoch{epoch}.pth")
         else:
             patience_counter += 1
 
         if patience_counter >= patience:
             print(f"Early stopping triggered after {epoch + 1} epochs")
             break
-    print("Training completed")
+    print("Training finished")
     return epoch + 1
 
 
@@ -478,12 +474,12 @@ def main():
     torch.cuda.manual_seed_all(42)
 
     config = {
-        'batch_size': 8,  # Reduced for stability
-        'num_epochs': 200,  # Increased epochs
-        'learning_rate': 2e-4,  # Slightly higher LR
+        'batch_size': 4,  # Reduced for stability
+        'num_epochs': 200,
+        'learning_rate': 5e-5,  # Reduced learning rate
         'slice_range': (2, 150),
         'n_steps': 1000,
-        'weight_decay': 1e-5,
+        'weight_decay': 1e-4,  # Increased weight decay
         'scheduler': {
             'min_lr': 1e-6,
             'warmup_epochs': 10
@@ -546,18 +542,14 @@ def main():
         model.parameters(),
         lr=config['learning_rate'],
         weight_decay=config['weight_decay'],
-        betas=(0.9, 0.99),  # Better momentum values
+        betas=(0.9, 0.95),  # Modified momentum parameters
         eps=1e-8
     )
 
-    scheduler = OneCycleLR(
+    scheduler = CosineAnnealingLR(
         optimizer,
-        max_lr=config['learning_rate'],
-        epochs=config['num_epochs'],
-        steps_per_epoch=len(train_loader),
-        pct_start=0.1,
-        div_factor=10,
-        final_div_factor=100
+        T_max=config['num_epochs'],
+        eta_min=config['scheduler']['min_lr']
     )
 
     writer = SummaryWriter('runs/syndiffV6')
