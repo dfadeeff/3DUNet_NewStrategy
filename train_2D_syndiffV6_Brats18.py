@@ -10,7 +10,7 @@ import numpy as np
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_2D_syndiffV5 import SynDiff2D
+from model_2D_syndiffV6 import SynDiff2D
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
@@ -261,7 +261,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, filename="checkpoint_syndiffV5.pth"):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, filename="checkpoint_syndiffV6.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -272,7 +272,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, filename="checkpoi
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV5.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV6.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -490,7 +490,7 @@ def main():
         }
     }
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     train_root_dir = '../data/brats18/train/combined/'
@@ -560,7 +560,7 @@ def main():
         final_div_factor=100
     )
 
-    writer = SummaryWriter('runs/syndiffV5')
+    writer = SummaryWriter('runs/syndiffV6')
 
     start_epoch = load_checkpoint(model, optimizer)
 
@@ -576,9 +576,9 @@ def main():
         config=config
     )
 
-    torch.save(model.state_dict(), 'syndiff_modelV5.pth')
+    torch.save(model.state_dict(), 'syndiff_modelV6.pth')
 
-    with open('patient_normalization_params_syndiffV5.json', 'w') as f:
+    with open('patient_normalization_params_syndiffV6.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()

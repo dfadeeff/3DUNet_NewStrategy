@@ -4,13 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torchvision
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
 import os
 import SimpleITK as sitk
-from model_2D_syndiffV5 import SynDiff2D
+from model_2D_syndiffV7 import SynDiff2D
 import matplotlib.pyplot as plt
 from pytorch_msssim import ssim, SSIM
 import json
@@ -287,23 +288,84 @@ def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV5.pth"):
         return 0
 
 
-def combined_loss(predicted_noise, target_noise, denoised, targets):
+class PerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Use VGG features pre-trained on ImageNet
+        vgg = torchvision.models.vgg16(pretrained=True).features
+        self.blocks = nn.ModuleList([
+            vgg[:4],  # relu1_2
+            vgg[4:9],  # relu2_2
+            vgg[9:16],  # relu3_3
+        ])
+
+        # Freeze VGG parameters
+        for p in self.parameters():
+            p.requires_grad = False
+
+        # Mean and std for normalization
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def normalize(self, x):
+        """Normalize to ImageNet statistics"""
+        x = (x + 1) / 2  # [-1, 1] -> [0, 1]
+        # Repeat grayscale to 3 channels
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        return (x - self.mean) / self.std
+
+    def forward(self, x, y):
+        # Normalize inputs
+        x = self.normalize(x)
+        y = self.normalize(y)
+
+        # Compute feature loss at multiple layers
+        loss = 0
+        x_feat = x
+        y_feat = y
+        for block in self.blocks:
+            x_feat = block(x_feat)
+            y_feat = block(y_feat)
+            loss += F.l1_loss(x_feat, y_feat)
+
+        return loss
+
+
+def combined_loss(predicted_noise, target_noise, denoised, targets, perceptual_loss):
     # Noise prediction loss
     noise_loss = F.huber_loss(predicted_noise, target_noise, reduction='mean', delta=0.1)
 
     # Reconstruction loss
     recon_loss = F.l1_loss(denoised, targets)
 
-    # Combined loss with weighting
-    return noise_loss + 0.1 * recon_loss
+    # Perceptual loss
+    perc_loss = perceptual_loss(denoised, targets)
+
+    # SSIM loss for structural similarity
+    ssim_value = ssim(denoised, targets, data_range=2.0)
+    ssim_loss = 1 - ssim_value
+
+    # Combined loss with weights
+    total_loss = (
+            1.0 * noise_loss +
+            0.1 * recon_loss +
+            0.1 * perc_loss +
+            0.05 * ssim_loss
+    )
+
+    return total_loss
 
 
 def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, config):
     model.train()
-    running_loss = 0.0
-    running_psnr = 0.0
-    running_ssim = 0.0
+    running_metrics = {"loss": 0.0, "noise_loss": 0.0, "recon_loss": 0.0,
+                       "perc_loss": 0.0, "ssim_loss": 0.0, "psnr": 0.0, "ssim": 0.0}
     n_batches = 0
+
+    # Initialize perceptual loss once
+    perceptual_loss = PerceptualLoss().to(device)
+    perceptual_loss.eval()  # Keep VGG in eval mode
 
     for batch_idx, (inputs, targets, _) in enumerate(tqdm(train_loader)):
         inputs = inputs.to(device)
@@ -334,10 +396,22 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
                 predicted_noise = model(model_input, t.float())
 
                 # Denoise for metrics
+                # Compute denoised prediction
                 denoised = (noisy_t2 - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
+                denoised = denoised.clamp(-1, 1)
+
+                # Component losses
+                noise_loss = F.huber_loss(predicted_noise, noise, reduction='mean', delta=0.1)
+                recon_loss = F.l1_loss(denoised, targets)
+                perc_loss = perceptual_loss(denoised, targets)
+                ssim_val = ssim(denoised, targets, data_range=2.0)
+                ssim_loss = 1 - ssim_val
 
                 # Combined loss
-                loss = combined_loss(predicted_noise, noise, denoised, targets)
+                loss = (1.0 * noise_loss +
+                        0.1 * recon_loss +
+                        0.1 * perc_loss +
+                        0.05 * ssim_loss)
 
                 if not torch.isnan(loss):
                     scaler.scale(loss).backward()
@@ -348,13 +422,18 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
 
                     # Compute metrics
                     with torch.no_grad():
+                        # Compute PSNR
                         mse = F.mse_loss(denoised, targets)
                         psnr = -10 * torch.log10(mse + 1e-8)
-                        ssim_val = ssim(denoised, targets, data_range=2.0)
 
-                        running_loss += loss.item()
-                        running_psnr += psnr.item()
-                        running_ssim += ssim_val.item()
+                        # Accumulate metrics
+                        running_metrics["loss"] += loss.item()
+                        running_metrics["noise_loss"] += noise_loss.item()
+                        running_metrics["recon_loss"] += recon_loss.item()
+                        running_metrics["perc_loss"] += perc_loss.item()
+                        running_metrics["ssim_loss"] += ssim_loss.item()
+                        running_metrics["psnr"] += psnr.item()
+                        running_metrics["ssim"] += ssim_val.item()
                         n_batches += 1
 
                 # Log batch metrics
@@ -369,54 +448,68 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
             continue
 
     if n_batches == 0:
-        return 0.0, 0.0, 0.0
+        return {k: 0.0 for k in running_metrics.keys()}
 
-    return (running_loss / n_batches,
-            running_psnr / n_batches,
-            running_ssim / n_batches)
+    return {k: v / n_batches for k, v in running_metrics.items()}
 
 
 def validate(model, val_loader, device, epoch, writer, config):
     model.eval()
-    running_loss = 0.0
-    running_psnr = 0.0
-    running_ssim = 0.0
+    running_metrics = {"loss": 0.0, "noise_loss": 0.0, "recon_loss": 0.0,
+                       "perc_loss": 0.0, "ssim_loss": 0.0, "psnr": 0.0, "ssim": 0.0}
+
+    perceptual_loss = PerceptualLoss().to(device)
+    perceptual_loss.eval()
 
     with torch.no_grad():
         for batch_idx, (inputs, targets, _) in enumerate(val_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs = inputs.to(device)
+            targets = targets.to(device)
 
-            # Exactly same process as training
-            noise = torch.randn_like(targets)
+            # Same process as training but without gradients
+            noise = torch.randn_like(targets).clamp(-3, 3) * (1.0 / math.sqrt(config['n_steps']))
             t = torch.ones(inputs.shape[0], device=device) * (config['n_steps'] // 2)
-            alpha_t = model.alpha_schedule(t)[:, None, None, None]
 
-            noisy_t2 = torch.sqrt(alpha_t) * targets + torch.sqrt(1 - alpha_t) * noise
+            alpha = model.alpha_schedule(t)[:, None, None, None]
+            sqrt_alpha = torch.sqrt(alpha)
+            sqrt_one_minus_alpha = torch.sqrt(1 - alpha)
+
+            noisy_t2 = sqrt_alpha * targets + sqrt_one_minus_alpha * noise
             model_input = torch.cat([inputs, noisy_t2], dim=1)
             predicted_noise = model(model_input, t.float())
 
-            # Loss on noise prediction
-            loss = F.mse_loss(predicted_noise, noise)
+            denoised = (noisy_t2 - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
+            denoised = denoised.clamp(-1, 1)
 
-            # Reconstruct using same formula as training
-            denoised_t2 = (noisy_t2 - torch.sqrt(1 - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
+            # Component losses
+            noise_loss = F.huber_loss(predicted_noise, noise, reduction='mean', delta=0.1)
+            recon_loss = F.l1_loss(denoised, targets)
+            perc_loss = perceptual_loss(denoised, targets)
+            ssim_val = ssim(denoised, targets, data_range=2.0)
+            ssim_loss = 1 - ssim_val
 
-            # Metrics
-            mse = F.mse_loss(denoised_t2, targets)
-            psnr = -10 * torch.log10(mse)
-            ssim_val = ssim(denoised_t2, targets, data_range=2.0)
+            loss = (1.0 * noise_loss +
+                    0.1 * recon_loss +
+                    0.1 * perc_loss +
+                    0.05 * ssim_loss)
 
-            running_loss += loss.item()
-            running_psnr += psnr.item()
-            running_ssim += ssim_val.item()
+            # Compute PSNR
+            mse = F.mse_loss(denoised, targets)
+            psnr = -10 * torch.log10(mse + 1e-8)
+
+            # Accumulate metrics
+            running_metrics["loss"] += loss.item()
+            running_metrics["noise_loss"] += noise_loss.item()
+            running_metrics["recon_loss"] += recon_loss.item()
+            running_metrics["perc_loss"] += perc_loss.item()
+            running_metrics["ssim_loss"] += ssim_loss.item()
+            running_metrics["psnr"] += psnr.item()
+            running_metrics["ssim"] += ssim_val.item()
 
             if batch_idx == 0:
-                visualize_batch(inputs, targets, denoised_t2, epoch, batch_idx, writer)
+                visualize_batch(inputs, targets, denoised, epoch, batch_idx, writer)
 
-    num_batches = len(val_loader)
-    return (running_loss / num_batches,
-            running_psnr / num_batches,
-            running_ssim / num_batches)
+    return {k: v / len(val_loader) for k, v in running_metrics.items()}
 
 
 def train(model, train_loader, val_loader, optimizer, scheduler, num_epochs, device, writer, config):
@@ -478,12 +571,18 @@ def main():
     torch.cuda.manual_seed_all(42)
 
     config = {
-        'batch_size': 8,  # Reduced for stability
-        'num_epochs': 200,  # Increased epochs
-        'learning_rate': 2e-4,  # Slightly higher LR
+        'batch_size': 4,  # Smaller for stability with perceptual loss
+        'num_epochs': 200,
+        'learning_rate': 1e-4,  # Lower for stability
         'slice_range': (2, 150),
         'n_steps': 1000,
         'weight_decay': 1e-5,
+        'loss_weights': {
+            'noise': 1.0,
+            'recon': 0.1,
+            'perceptual': 0.1,
+            'ssim': 0.05
+        },
         'scheduler': {
             'min_lr': 1e-6,
             'warmup_epochs': 10
