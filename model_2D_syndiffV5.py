@@ -26,6 +26,47 @@ class AttentionBlock(nn.Module):
         return x.transpose(1, 2).reshape(-1, x.shape[-1], *size)
 
 
+class CrossAttention(nn.Module):
+    def __init__(self, channels, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (channels // num_heads) ** -0.5
+
+        self.to_q = nn.Linear(channels, channels)
+        self.to_k = nn.Linear(channels, channels)
+        self.to_v = nn.Linear(channels, channels)
+        self.to_out = nn.Linear(channels, channels)
+
+        self.norm = nn.GroupNorm(8, channels)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        # Reshape to sequence
+        x_seq = x.view(b, c, -1).transpose(-2, -1)  # [B, H*W, C]
+
+        # Self-attention
+        q = self.to_q(x_seq)
+        k = self.to_k(x_seq)
+        v = self.to_v(x_seq)
+
+        # Split heads
+        q, k, v = map(lambda t: t.view(b, -1, self.num_heads, c // self.num_heads).transpose(1, 2), (q, k, v))
+
+        # Attention
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+
+        # Combine heads
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(b, -1, c)
+        out = self.to_out(out)
+
+        # Reshape back to feature map
+        out = out.transpose(-2, -1).view(b, c, h, w)
+        return self.norm(out) + x
+
+
 class FeatureRefinementBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -87,115 +128,136 @@ class ResidualBlock2D(nn.Module):
 
 class UNet2D(nn.Module):
     def __init__(self, in_channels, out_channels, time_dim):
-        super(UNet2D, self).__init__()
+        super().__init__()
         self.time_dim = time_dim
-        features = [64, 128, 256, 512]
 
-        # Time embedding with refinement
+        # More gradual feature scaling
+        self.features = [32, 64, 128, 256, 512]  # Changed from [64, 128, 256, 512]
+
+        # Improved time embedding
+
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_dim),
             nn.Linear(time_dim, time_dim * 4),
             nn.GELU(),
-            nn.Linear(time_dim * 4, time_dim)
+            nn.Linear(time_dim * 4, time_dim * 2),
+            nn.GELU(),
+            nn.Linear(time_dim * 2, time_dim),
         )
 
-        # Initial projection
+        # Better initial feature extraction
         self.conv0 = nn.Sequential(
-            nn.Conv2d(in_channels, features[0], 3, padding=1),
-            FeatureRefinementBlock(features[0])
+            nn.Conv2d(in_channels, self.features[0], 7, padding=3),  # Larger kernel
+            nn.GroupNorm(8, self.features[0]),
+            nn.GELU(),
+            nn.Conv2d(self.features[0], self.features[0], 3, padding=1),
+            FeatureRefinementBlock(self.features[0])
         )
 
-        # Downsample with attention and refinement
+        # Time projections for down path - ADD THIS
+        self.time_projections_down = nn.ModuleList([
+            nn.Linear(time_dim, self.features[i + 1])
+            for i in range(len(self.features) - 1)
+        ])
+
+        # Time projections for up path - ADD THIS
+        self.time_projections_up = nn.ModuleList([
+            nn.Linear(time_dim, self.features[i])
+            for i in reversed(range(len(self.features) - 1))
+        ])
+
+        # Downsample blocks with better channel scaling
         self.downs = nn.ModuleList([
             nn.ModuleList([
-                ResidualBlock2D(features[i], features[i + 1], use_attention=(i >= len(features) // 2)),
-                FeatureRefinementBlock(features[i + 1]),
-                nn.Conv2d(features[i + 1], features[i + 1], 3, stride=2, padding=1)
-            ]) for i in range(len(features) - 1)
+                ResidualBlock2D(
+                    self.features[i],
+                    self.features[i + 1],
+                    use_attention=(i >= len(self.features) // 2)
+                ),
+                FeatureRefinementBlock(self.features[i + 1]),
+                nn.Sequential(
+                    nn.GroupNorm(8, self.features[i + 1]),
+                    nn.Conv2d(self.features[i + 1], self.features[i + 1], 4, stride=2, padding=1)
+                )
+            ]) for i in range(len(self.features) - 1)
         ])
 
         # Enhanced bottleneck
+        mid_features = self.features[-1]
         self.bottleneck = nn.Sequential(
-            ResidualBlock2D(features[-1], features[-1], use_attention=True),
-            FeatureRefinementBlock(features[-1]),
-            ResidualBlock2D(features[-1], features[-1], use_attention=True)
+            ResidualBlock2D(mid_features, mid_features, use_attention=True),
+            FeatureRefinementBlock(mid_features),
+            CrossAttention(mid_features),  # Added cross-attention
+            ResidualBlock2D(mid_features, mid_features, use_attention=True)
         )
 
-        # Upsample with attention and refinement
+        # Upsample blocks with skip connections
         self.ups = nn.ModuleList([
             nn.ModuleList([
-                nn.ConvTranspose2d(features[i + 1], features[i], 2, 2),
-                ResidualBlock2D(features[i] * 2, features[i], use_attention=(i >= len(features) // 2)),
-                FeatureRefinementBlock(features[i])
-            ]) for i in reversed(range(len(features) - 1))
+                nn.ConvTranspose2d(self.features[i + 1], self.features[i], 4, 2, 1),
+                ResidualBlock2D(self.features[i] * 2, self.features[i], use_attention=(i >= len(self.features) // 2)),
+                FeatureRefinementBlock(self.features[i]),
+                CrossAttention(self.features[i]) if i >= len(self.features) // 2 else nn.Identity()
+            ]) for i in reversed(range(len(self.features) - 1))
         ])
 
-        # Multiple output heads for progressive refinement
-        self.output_refine = nn.ModuleList([
-            FeatureRefinementBlock(features[0]),
-            nn.Conv2d(features[0], out_channels, 1),
-            nn.Tanh()  # Added to constrain output range
-        ])
-
-        # Time dimension projections for down path
-        self.time_projections_down = nn.ModuleList([
-            nn.Linear(time_dim, features[i + 1]) for i in range(len(features) - 1)
-        ])
-
-        # Time dimension projections for up path
-        self.time_projections_up = nn.ModuleList([
-            nn.Linear(time_dim, features[i]) for i in reversed(range(len(features) - 1))
-        ])
+        # Enhanced output refinement
+        self.output_refine = nn.Sequential(
+            ResidualBlock2D(self.features[0], self.features[0]),
+            FeatureRefinementBlock(self.features[0]),
+            nn.GroupNorm(8, self.features[0]),
+            nn.GELU(),
+            nn.Conv2d(self.features[0], out_channels, 3, padding=1),
+            nn.Tanh()
+        )
 
     def forward(self, x, t):
-        # Ensure proper dimensions for time embedding
+        # Time embedding with better conditioning
         if t.dim() == 1:
-            t = t.float()  # Ensure float type
-            emb = self.time_mlp(t)  # This will give [B, time_dim]
+            t = t.float()
+            emb = self.time_mlp(t)
         else:
-            # Handle any other case by flattening
             t = t.float().view(-1)
             emb = self.time_mlp(t)
 
-        # Ensure emb has the right shape for broadcasting with features
         emb = emb.view(-1, self.time_dim)
 
-        # Initial conv
+        # Initial conv with feature extraction
         x = self.conv0(x)
 
-        # Rest of the forward pass
+        # Store residuals for skip connections
         residuals = []
-        for i, down in enumerate(self.downs):
-            residuals.append(x)
-            x = down[0](x)  # ResidualBlock2D with attention
-            x = down[1](x)  # Feature refinement
-            x = down[2](x)  # Downsample
 
-            # Project time embedding to the right dimension and add
+        # Down blocks with time conditioning
+        for i, (resblock, refine, down) in enumerate(self.downs):
+            residuals.append(x)
+            x = resblock(x)
+            x = refine(x)
+
+            # Add time embedding
             time_emb = self.time_projections_down[i](emb)
-            # Reshape time embedding for broadcasting
             time_emb = time_emb.view(time_emb.shape[0], -1, 1, 1)
             x = x + time_emb
 
+            x = down(x)
+
+        # Bottleneck processing
         x = self.bottleneck(x)
 
-        for i, (up, residual) in enumerate(zip(self.ups, reversed(residuals))):
-            x = up[0](x)  # Upsample
-            x = torch.cat((x, residual), dim=1)  # Skip connection
-            x = up[1](x)  # ResidualBlock2D with attention
-            x = up[2](x)  # Feature refinement
+        # Up blocks with skip connections
+        for i, (up, resblock, refine, attn) in enumerate(self.ups):
+            x = up(x)
+            x = torch.cat((x, residuals.pop()), dim=1)
+            x = resblock(x)
+            x = refine(x)
+            x = attn(x)  # Apply attention if present
 
-            # Project time embedding and add
+            # Add time embedding
             time_emb = self.time_projections_up[i](emb)
             time_emb = time_emb.view(time_emb.shape[0], -1, 1, 1)
             x = x + time_emb
 
-        # Final refinement and output
-        x = self.output_refine[0](x)
-        x = self.output_refine[1](x)
-        x = self.output_refine[2](x)
-
-        return x
+        return self.output_refine(x)
 
 
 class SynDiff2D(nn.Module):
@@ -204,6 +266,7 @@ class SynDiff2D(nn.Module):
         # Pass in_channels + 1 to UNet2D to account for the noisy channel
         self.unet = UNet2D(in_channels + 1, out_channels, time_dim)
         self.n_steps = n_steps
+        self.time_scale = math.pi
 
     def forward(self, x, t):
         return self.unet(x, t)
@@ -232,18 +295,12 @@ class SynDiff2D(nn.Module):
         if not isinstance(t, torch.Tensor):
             t = torch.tensor(t, dtype=torch.float32, device=self.unet.conv0[0].weight.device)
 
-        # Add small epsilon for numerical stability
-        eps = 1e-8
-
-        # Scale time to [0, 1] range and add offset for stability
-        t_scaled = (t / self.n_steps + 0.008) / 1.008
-
-        # Compute stable cosine schedule
-        angle = t_scaled * torch.pi / 2
+        # Better time scaling
+        t_norm = (t.float() / self.n_steps)
+        angle = ((t_norm + 0.008) / 1.008) * math.pi / 2
         alpha = torch.cos(angle).pow(2)
 
-        # Clamp values for stability
-        return alpha.clamp(min=eps, max=1.0 - eps)
+        return alpha.clamp(min=1e-5, max=0.9999)
 
 
 class SinusoidalPosEmb(nn.Module):

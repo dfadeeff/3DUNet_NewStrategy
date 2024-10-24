@@ -261,7 +261,7 @@ def visualize_batch(inputs, targets, outputs, epoch, batch_idx, writer):
     plt.close(fig)
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, filename="checkpoint_syndiffV4.pth"):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, filename="checkpoint_syndiffV5.pth"):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -272,7 +272,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, filename="checkpoi
     print(f"Checkpoint saved: {filename}")
 
 
-def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV4.pth"):
+def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV5.pth"):
     if os.path.isfile(filename):
         print(f"Loading checkpoint '{filename}'")
         checkpoint = torch.load(filename)
@@ -285,6 +285,17 @@ def load_checkpoint(model, optimizer, filename="checkpoint_syndiffV4.pth"):
     else:
         print(f"No checkpoint found at '{filename}'")
         return 0
+
+
+def combined_loss(predicted_noise, target_noise, denoised, targets):
+    # Noise prediction loss
+    noise_loss = F.huber_loss(predicted_noise, target_noise, reduction='mean', delta=0.1)
+
+    # Reconstruction loss
+    recon_loss = F.l1_loss(denoised, targets)
+
+    # Combined loss with weighting
+    return noise_loss + 0.1 * recon_loss
 
 
 def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, config):
@@ -308,39 +319,35 @@ def train_epoch(model, train_loader, optimizer, scaler, device, epoch, writer, c
                 noise = torch.randn_like(targets).clamp(-3, 3) * (1.0 / math.sqrt(config['n_steps']))
 
                 # Get timesteps
-                t = torch.randint(0, config['n_steps'], (inputs.shape[0],), device=device)
+                t = torch.randint(1, config['n_steps'], (inputs.shape[0],), device=device)
 
                 # Get diffusion parameters
                 alpha = model.alpha_schedule(t)[:, None, None, None]
-                alpha = alpha.clamp(min=1e-5, max=1.0)  # Prevent division by zero
+                sqrt_alpha = torch.sqrt(alpha)
+                sqrt_one_minus_alpha = torch.sqrt(1 - alpha)
 
-                # Create noisy target
-                noisy_t2 = torch.sqrt(alpha) * targets + torch.sqrt(1 - alpha) * noise
+                # Create noisy target with better scaling
+                noisy_t2 = sqrt_alpha * targets + sqrt_one_minus_alpha * noise
 
                 # Model prediction
                 model_input = torch.cat([inputs, noisy_t2], dim=1)
                 predicted_noise = model(model_input, t.float())
 
-                # Calculate loss with stability checks
-                loss = F.smooth_l1_loss(predicted_noise, noise)  # Use Huber loss for stability
+                # Denoise for metrics
+                denoised = (noisy_t2 - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
 
-                if not torch.isnan(loss) and not torch.isinf(loss):
-                    # Backward pass with gradient scaling
+                # Combined loss
+                loss = combined_loss(predicted_noise, noise, denoised, targets)
+
+                if not torch.isnan(loss):
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-
-                    # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                     scaler.step(optimizer)
                     scaler.update()
 
                     # Compute metrics
                     with torch.no_grad():
-                        # Reconstruct target from noise
-                        denoised = (noisy_t2 - torch.sqrt(1 - alpha) * predicted_noise) / torch.sqrt(alpha)
-                        denoised = denoised.clamp(-1, 1)
-
                         mse = F.mse_loss(denoised, targets)
                         psnr = -10 * torch.log10(mse + 1e-8)
                         ssim_val = ssim(denoised, targets, data_range=2.0)
@@ -479,8 +486,7 @@ def main():
         'weight_decay': 1e-5,
         'scheduler': {
             'min_lr': 1e-6,
-            'warmup_epochs': 10,  # Longer warmup
-            'cycle_mult': 1.5
+            'warmup_epochs': 10
         }
     }
 
@@ -540,8 +546,8 @@ def main():
         model.parameters(),
         lr=config['learning_rate'],
         weight_decay=config['weight_decay'],
-        betas=(0.9, 0.95),  # Modified beta values
-        eps=1e-8  # Increased epsilon
+        betas=(0.9, 0.99),  # Better momentum values
+        eps=1e-8
     )
 
     scheduler = OneCycleLR(
@@ -549,12 +555,12 @@ def main():
         max_lr=config['learning_rate'],
         epochs=config['num_epochs'],
         steps_per_epoch=len(train_loader),
-        pct_start=0.15,  # Longer warmup percentage
-        div_factor=25,  # Gentler learning rate range
-        final_div_factor=1000
+        pct_start=0.1,
+        div_factor=10,
+        final_div_factor=100
     )
 
-    writer = SummaryWriter('runs/syndiffV4')
+    writer = SummaryWriter('runs/syndiffV5')
 
     start_epoch = load_checkpoint(model, optimizer)
 
@@ -570,9 +576,9 @@ def main():
         config=config
     )
 
-    torch.save(model.state_dict(), 'syndiff_modelV4.pth')
+    torch.save(model.state_dict(), 'syndiff_modelV5.pth')
 
-    with open('patient_normalization_params_syndiffV4.json', 'w') as f:
+    with open('patient_normalization_params_syndiffV5.json', 'w') as f:
         json.dump(train_dataset.normalization_params, f)
 
     writer.close()
